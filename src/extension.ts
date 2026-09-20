@@ -1,6 +1,7 @@
 import path from "node:path";
 import { getAgentDir, SessionManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createBrowserTool } from "./browser-tool.ts";
+import { registerBrowserRemoteSetup } from "./browser-remote.ts";
 import { registerWebBackendCommand } from "./backend-command.ts";
 import { createBrowserDefault, type BrowserDefault } from "./browser-default.ts";
 import { registerBrowserDefaultCommand } from "./browser-default-command.ts";
@@ -47,6 +48,7 @@ export default function browserExtension(pi: ExtensionAPI): void {
         browserDefault: defaults,
         profileDir: path.join(root, "manual"), artifactDir: snapshots.directory,
         browser: settings.browser, headless: settings.headless, executable: settings.executable,
+        onSetup: ctx.hasUI ? (instructions, signal) => ctx.ui.confirm("Browser connection needs setup", `${instructions}\n\nAfter restoring the publisher tunnel/browser, confirm to retry once. Decline to return the connection error.`, { signal }) : undefined,
       }),
     };
     return host;
@@ -71,12 +73,13 @@ export default function browserExtension(pi: ExtensionAPI): void {
   });
   registerWebBackendCommand(pi, ctx => runtime(ctx).web);
   registerBrowserDefaultCommand(pi, ctx => runtime(ctx).defaults);
+  registerBrowserRemoteSetup(pi);
   pi.registerCommand("browser-close", {
-    description: "Close a named browser-tool session (default: default). Its profile and artifacts remain.",
+    description: "Close the browser-tool destination: [remote], defaulting to PI_BROWSER_REMOTE or local launch. External browsers remain open. Profiles and evidence are retained.",
     async handler(args, ctx) {
-      if (!host) { ctx.ui.notify("No browser sessions are open.", "info"); return; }
-      await host.browser.closeSession(args.trim() || "default");
-      ctx.ui.notify("Browser session closed.", "info");
+      if (!host) { ctx.ui.notify("No browsers are open.", "info"); return; }
+      await host.browser.closeBrowser(args.trim() || undefined);
+      ctx.ui.notify("Browser closed.", "info");
     },
   });
   pi.on("session_start", async (event, ctx) => {

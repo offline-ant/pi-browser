@@ -1,4 +1,7 @@
-// Shared Firefox BiDi transport over one long-lived Node WebSocket connection.
+import type WebSocket from "ws";
+import { connectSocket } from "./socket.ts";
+
+// Shared Firefox BiDi transport over one long-lived WebSocket connection.
 export type BidiObject = Record<string, unknown>;
 export type BidiListener = (method: string, params: BidiObject) => void;
 
@@ -53,8 +56,11 @@ export class Bidi {
           if (!pending) return;
           this.pending.delete(message.id);
           clearTimeout(pending.timer);
-          if (message.type === "error") pending.reject(new BidiCommandError(`BiDi ${String(message.error)}: ${String(message.message)}`));
-          else pending.resolve(object(message.result));
+          if (message.type === "error" && typeof message.error === "string" && typeof message.message === "string") {
+            pending.reject(new BidiCommandError(`BiDi ${message.error}: ${message.message}`));
+          } else if (message.type === "success" && message.result !== null && typeof message.result === "object" && !Array.isArray(message.result) && !("error" in message)) {
+            pending.resolve(object(message.result));
+          } else pending.reject(new Error("Invalid WebDriver BiDi response; check that the endpoint belongs to Firefox"));
         } else if (message.type === "event" && typeof message.method === "string") {
           for (const listener of this.listeners) listener(message.method, object(message.params));
         }
@@ -66,25 +72,8 @@ export class Bidi {
     socket.addEventListener("error", () => this.fail(new Error("Firefox debugging connection failed")));
   }
 
-  static async connect(url: string, timeoutMs = 5_000): Promise<Bidi> {
-    const endpoint = new URL(url);
-    if (endpoint.protocol !== "ws:" || !["127.0.0.1", "[::1]", "localhost"].includes(endpoint.hostname)) {
-      throw new Error("Firefox debugging endpoint must be loopback-only");
-    }
-    const socket = new WebSocket(url);
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        socket.close();
-        reject(new Error("Timed out connecting to Firefox debugging socket"));
-      }, timeoutMs);
-      socket.addEventListener("open", () => { clearTimeout(timer); resolve(); }, { once: true });
-      socket.addEventListener("error", () => {
-        clearTimeout(timer);
-        socket.close();
-        reject(new Error("Could not connect to Firefox debugging socket"));
-      }, { once: true });
-    });
-    return new Bidi(socket);
+  static async connect(url: string, timeoutMs = 5_000, signal?: AbortSignal, socketPath?: string): Promise<Bidi> {
+    return new Bidi(await connectSocket(url, "Firefox", timeoutMs, signal, socketPath));
   }
 
   onEvent(listener: BidiListener): () => void {

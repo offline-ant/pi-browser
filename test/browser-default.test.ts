@@ -167,7 +167,7 @@ test("manual calls snapshot their queued default; explicit engines win and execu
   assert.deepEqual(requests.map(request => [request.browser, request.executable]), [
     ["chromium", "/fixture/chromium"], ["firefox", undefined], ["firefox", undefined], ["chromium", "/fixture/chromium"],
   ]);
-  for (const request of requests) assert.equal(request.profileDir, path.join(root, "default", request.browser!));
+  for (const request of requests) assert.equal(request.profileDir, path.join(root, request.browser!));
 });
 
 test("web research launches the selected engine and applies executable overrides only to the configured engine", async t => {

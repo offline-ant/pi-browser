@@ -46,9 +46,10 @@ for (const browser of ["chromium", "firefox"] as const) {
       await new Promise<void>(resolve => server.close(() => resolve()));
       await rm(root, { recursive: true, force: true });
     });
-    assert(Check(set.tool.parameters, { session_id: "default", browser, url: origin, eval: "1" }));
+    assert(Check(set.tool.parameters, { browser, url: origin, eval: "1" }));
+    assert(!Check(set.tool.parameters, { session_id: "default" }));
     assert(!Check(set.tool.parameters, { backend: "browser" }));
-    for (const params of [{ session_id: "../escape" }, { url: "file:///etc/passwd" }, { url: "https://user:pass@example.com" }]) {
+    for (const params of [{ remote: "../escape" }, { url: "file:///etc/passwd" }, { url: "https://user:pass@example.com" }]) {
       await assert.rejects(execute(params));
     }
     assert.equal(launches.mock.callCount(), 0);
@@ -56,7 +57,7 @@ for (const browser of ["chromium", "firefox"] as const) {
       execute({ browser, url: `${origin}/one`, eval: "document.querySelector('main').textContent = 'Edited fixture'" }),
       execute({ eval: "document.querySelector('main').textContent" }),
     ]);
-    assert.equal(launches.mock.callCount(), 1, "same-name concurrent calls share one process/profile request");
+    assert.equal(launches.mock.callCount(), 1, "same-destination concurrent calls share one process/profile request");
     assert.equal(second.details.eval_result, "Edited fixture");
     assert.equal(first.details.tab_id, second.details.tab_id);
     const firstSnapshot = await set.snapshots.info(first.details.snapshot);
@@ -66,7 +67,7 @@ for (const browser of ["chromium", "firefox"] as const) {
     for (const file of Object.values(firstSnapshot.paths)) assert.equal((await stat(file)).mode & 0o777, 0o600);
     assert.equal((await stat(path.dirname(firstSnapshot.paths.html!))).mode & 0o777, 0o700);
     assert.deepEqual([...(await readFile(firstSnapshot.paths.screenshot!)).subarray(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10]);
-    await assert.rejects(execute({ browser: browser === "chromium" ? "firefox" : "chromium", url: `${origin}/wrong` }), /choose another session_id/);
+    await assert.rejects(execute({ browser: browser === "chromium" ? "firefox" : "chromium", url: `${origin}/wrong` }), /Use \/browser-close before changing its engine/);
     assert.equal((await execute({ eval: "document.querySelector('main').textContent" })).details.eval_result, "Edited fixture");
     assert(!navigations.includes("/wrong"));
     assert.equal(launches.mock.callCount(), 1);
@@ -110,7 +111,7 @@ for (const browser of ["chromium", "firefox"] as const) {
     entered = deferred();
     const beforeClose = execute({ eval: "fetch('/gate').then(() => 'before close')" });
     await entered.promise;
-    const close = set.closeSession("default");
+    const close = set.closeBrowser();
     const reopened = execute({ browser, url: `${origin}/reopened`, eval: "document.title" });
     gate!.end("continue");
     assert.equal((await beforeClose).details.eval_result, "before close");
@@ -121,7 +122,7 @@ for (const browser of ["chromium", "firefox"] as const) {
 
     // Simulate an external close of this disposable process, never a user's
     // browser. The profile lease records the exact process created by this test.
-    const ownerFile = path.join(root, "manual", "default", browser, ".pi-browser-owner", "owner.json");
+    const ownerFile = path.join(root, "manual", browser, ".pi-browser-owner", "owner.json");
     const owner = JSON.parse(await readFile(ownerFile, "utf8"));
     assert.equal(owner.pid, process.pid);
     assert.equal(typeof owner.browserPid, "number");
@@ -132,7 +133,7 @@ for (const browser of ["chromium", "firefox"] as const) {
     }
     const manualRecovery = await execute({ url: `${origin}/manual-recovery`, eval: "document.title" });
     assert.equal(manualRecovery.details.title, "/manual-recovery");
-    assert.equal(manualRecovery.details.browser, browser, "recovery retains the named engine, not the host default");
+    assert.equal(manualRecovery.details.browser, browser, "recovery retains the destination's engine, not the host default");
     assert.notEqual(manualRecovery.details.tab_id, restored.details.tab_id);
 
     entered = deferred();
@@ -148,32 +149,14 @@ for (const browser of ["chromium", "firefox"] as const) {
     await entered.promise;
     const shutdown = set.close();
     assert.equal(shutdown, set.close(), "cleanup is idempotent");
-    await assert.rejects(execute({ session_id: "late" }), /closed/);
-    await assert.rejects(set.closeSession("default"), /closed/);
+    await assert.rejects(execute({}), /closed/);
+    await assert.rejects(set.closeBrowser(), /closed/);
     await interruption;
     const interruptedInfo = await set.snapshots.info(interruptedSnapshot);
     assert(interruptedInfo.available.includes("before-screenshot"));
     assert(!interruptedInfo.available.includes("screenshot"), "cancelled eval must not capture a fake final image");
     await shutdown;
-    const profiles = await readdir(path.join(root, "manual", "default", browser));
+    const profiles = await readdir(path.join(root, "manual", browser));
     assert(!profiles.includes(".pi-browser-owner"));
   });
 }
-
-test("in-flight launches reserve the eight-session limit and failed requests release capacity", async t => {
-  const root = await mkdtemp(path.join(tmpdir(), "pi-browser-capacity-"));
-  const gate = deferred();
-  const create = t.mock.method(BrowserProcessLauncher, "create", async () => {
-    await gate.promise;
-    throw new Error("fixture launch failure");
-  });
-  const set = createBrowserTool({ profileDir: root, artifactDir: root, headless: true });
-  t.after(async () => { gate.resolve(); await set.close(); await rm(root, { recursive: true, force: true }); });
-  const pending = Array.from({ length: 8 }, (_, index) => assert.rejects(set.tool.execute(String(index), { session_id: `session-${index}` }, undefined, undefined, context), /fixture launch failure/));
-  await assert.rejects(set.tool.execute("overflow", { session_id: "overflow" }, undefined, undefined, context), /Eight named browser/);
-  assert.equal(create.mock.callCount(), 8);
-  gate.resolve();
-  await Promise.all(pending);
-  await assert.rejects(set.tool.execute("retry", { session_id: "retry" }, undefined, undefined, context), /fixture launch failure/);
-  assert.equal(create.mock.callCount(), 9);
-});

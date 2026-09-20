@@ -157,7 +157,7 @@ for (const kind of ["chromium", "firefox"] as const satisfies readonly BrowserKi
     const page = await browser.openTab(origin);
     const abort = new AbortController();
     const pending = page.evaluate("(async () => { await new Promise(resolve => setTimeout(resolve, 400)); await fetch('/resumed'); })()", { signal: abort.signal, timeoutMs: 20_000 });
-    const checked = assert.rejects(pending, kind === "firefox" ? /cancelled.*Research Firefox stopped/ : /cancelled.*Chromium tab closed/);
+    const checked = assert.rejects(pending, kind === "firefox" ? /cancelled.*Firefox stopped/ : /cancelled.*Chromium tab closed/);
     await delay(50);
     const cancellationStarted = Date.now();
     abort.abort();

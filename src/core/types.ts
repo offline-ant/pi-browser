@@ -11,15 +11,24 @@ export interface BrowserOptions {
   noSandbox?: boolean;
 }
 
+/** Connect to an external browser without owning its process or profile. */
+export interface BrowserConnectOptions {
+  browser: BrowserKind;
+  /** Unix socket forwarding to the publisher's 127.0.0.1:9222 debugging port. */
+  socketPath: string;
+  signal?: AbortSignal;
+}
+
 export interface OperationOptions {
   signal?: AbortSignal;
   timeoutMs?: number;
 }
 
 export interface BrowserSession {
-  /** True once shutdown starts or the owned process/transport is lost. */
+  /** True once cleanup starts or the connection/owned process is lost. */
   readonly closed: boolean;
   openTab(url?: string): Promise<BrowserTab>;
+  /** Close owned tabs; stop the browser only when this session launched it. */
   close(): Promise<void>;
 }
 

@@ -1,0 +1,83 @@
+#!/bin/sh
+# Installed by /browser-remote-setup with the receiver target and socket directory.
+set -eu
+socket_directory=__PI_BROWSER_SOCKET_DIRECTORY__
+default_target=__PI_BROWSER_SSH_TARGET__
+
+fail() {
+  printf '%s\n' "browser-open: $*" >&2
+  exit 1
+}
+
+[ "$#" -le 1 ] || fail 'Usage: browser-open [pi-ssh-target]'
+target=${1:-$default_target}
+case "$target" in ''|-*|*[[:space:][:cntrl:]]*) fail 'Use an SSH alias, IP, or user@host as the target.' ;; esac
+for tool in curl ssh ps awk; do
+  command -v "$tool" >/dev/null 2>&1 || fail "Install $tool on this publisher, then rerun the command."
+done
+name=$(hostname)
+case "$name" in
+  ''|[!a-zA-Z0-9]*|*[!a-zA-Z0-9_.-]*) fail 'Hostname must start with a letter or digit and contain only letters, digits, dots, underscores or hyphens.' ;;
+esac
+[ "${#name}" -le 64 ] || fail 'Hostname must be at most 64 characters.'
+profile="$HOME/.local/share/pi-browser/firefox-9222"
+
+listening() {
+  # Firefox returns HTTP 400 here; do not treat a response alone as ownership.
+  curl --noproxy '*' --silent --max-time 1 --output /dev/null http://127.0.0.1:9222/
+}
+
+firefox_state() {
+  processes=$(ps -ww -u "$(id -u)" -o args=) || fail "Cannot inspect this user's Firefox processes."
+  # Compare literal argument boundaries, not a profile-derived regular expression.
+  printf '%s\n' "$processes" | PI_BROWSER_PROFILE="$profile" awk '
+    {
+      executable = $1
+      sub(/^.*\//, "", executable)
+      if (executable != "firefox" && executable != "firefox-esr" && executable != "firefox-bin") next
+      args = " " $0 " "
+      profile = ENVIRON["PI_BROWSER_PROFILE"]
+      if (!index(args, " --profile " profile " ") && !index(args, " --profile=" profile " ")) next
+      state = "busy"
+      if (index(args, " --remote-debugging-port 9222 ") ||
+          index(args, " --remote-debugging-port=9222 ")) {
+        state = "debugging"
+        exit
+      }
+    }
+    END { print state }
+  '
+}
+
+state=$(firefox_state)
+if listening; then
+  [ "$state" = debugging ] || fail "Port 9222 is occupied, but this user's dedicated Firefox profile could not be verified: $profile. No browser was touched."
+  printf 'Reusing the dedicated Firefox profile %s; no browser will be restarted.\n' "$profile"
+else
+  [ -z "$state" ] || fail "Firefox already has $profile open, but its debugging port is unavailable. Check $profile/browser.log or wait for startup; no second browser was started."
+  case "$(uname -s)" in
+    Darwin) bin='/Applications/Firefox.app/Contents/MacOS/firefox' ;;
+    Linux) bin=$(command -v firefox || command -v firefox-esr) || fail 'Install Firefox on this publisher.' ;;
+    *) fail 'Automatic Firefox launch supports Darwin and Linux.' ;;
+  esac
+  [ -x "$bin" ] || fail "Firefox executable not found: $bin"
+  umask 077
+  mkdir -p "$profile"
+  chmod 700 "$profile"
+  log="$profile/browser.log"
+  printf 'Starting Firefox with profile %s\n' "$profile"
+  nohup "$bin" --new-instance --profile "$profile" --remote-debugging-port 9222 </dev/null >>"$log" 2>&1 &
+  pid=$!
+  attempts=0
+  until listening; do
+    kill -0 "$pid" 2>/dev/null || fail "Firefox exited. Check $log; use a real desktop terminal and do not reuse a busy profile."
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 15 ] || fail "Firefox did not open port 9222. Check $log; no browser was stopped."
+    sleep 1
+  done
+  [ "$(firefox_state)" = debugging ] || fail "Cannot verify the dedicated Firefox profile on port 9222. Check $log; no tunnel was opened."
+fi
+
+printf 'Publishing remote %s to %s. Ctrl+C closes the tunnel, not the browser.\n' "$name" "$target"
+printf '%s\n' 'If forwarding fails on an old socket, confirm its previous tunnel stopped before removing only that socket on the Pi host.'
+exec ssh -NT -o ExitOnForwardFailure=yes -R "$socket_directory/$name.sock:127.0.0.1:9222" "$target"

@@ -1,5 +1,5 @@
 import path from "node:path";
-import { defineTool, truncateHead } from "@earendil-works/pi-coding-agent";
+import { defineTool, truncateHead, type AgentToolResult } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { launchBrowser, type BrowserKind, type BrowserSession, type BrowserTab } from "./core/index.ts";
@@ -7,6 +7,7 @@ import { createBrowserDefault, type BrowserDefault } from "./browser-default.ts"
 import { capturePage } from "./capture.ts";
 import { publicBrowserError } from "./core/process.ts";
 import { SnapshotStore, snapshotSummary, type SnapshotInput, type SnapshotFormat } from "./snapshots.ts";
+import { connectRemote, validateRemote, type BrowserSetupHandler } from "./browser-remote.ts";
 
 export interface BrowserToolOptions {
   profileDir: string;
@@ -16,11 +17,14 @@ export interface BrowserToolOptions {
   snapshots?: SnapshotStore;
   headless?: boolean;
   executable?: string;
+  /** Publisher socket; defaults to PI_BROWSER_REMOTE. */
+  remote?: string;
+  onSetup?: BrowserSetupHandler;
 }
 
 export interface BrowserResultDetails {
-  session_id: string;
   browser: BrowserKind;
+  remote?: string;
   tab_id: string;
   url: string;
   title: string;
@@ -32,25 +36,26 @@ export interface BrowserResultDetails {
   eval_error?: string;
 }
 
-interface NamedBrowser {
-  browser: BrowserKind;
+interface DestinationBrowser {
+  target: { browser: BrowserKind; remote?: string };
   owner: BrowserSession;
   tab: BrowserTab;
 }
 
-/** Named live sessions produce immutable evidence readable without touching the browser. */
+/** One persistent tab per destination produces immutable evidence. */
 export function createBrowserTool(options: BrowserToolOptions) {
   const snapshots = options.snapshots ?? new SnapshotStore({ directory: options.artifactDir || undefined });
   const defaults = options.browserDefault ?? createBrowserDefault({ browser: options.browser });
   const executableBrowser = options.browser ?? defaults.getState().configured;
-  const sessions = new Map<string, NamedBrowser>();
-  const queues = new Map<string, Promise<unknown>>();
+  const defaultRemote = options.remote ?? process.env.PI_BROWSER_REMOTE;
+  const browsers = new Map<string | undefined, DestinationBrowser>();
+  const queues = new Map<string | undefined, Promise<unknown>>();
   const stopped = new AbortController();
-  let starting = 0;
   let closing: Promise<void> | undefined;
 
-  // Cancellation of a waiter never releases the running session's slot.
-  function enqueue<T>(id: string, run: () => Promise<T>, signal = stopped.signal): Promise<T> {
+  // Undefined is the local destination; remote names have their own queues.
+  // Cancellation of a waiter never releases the running destination's slot.
+  function enqueue<T>(id: string | undefined, run: () => Promise<T>, signal = stopped.signal): Promise<T> {
     signal.throwIfAborted();
     stopped.signal.throwIfAborted();
     let abort = () => {};
@@ -73,51 +78,62 @@ export function createBrowserTool(options: BrowserToolOptions) {
 
   const tool = defineTool({
     name: "browser", label: "Browser",
-    description: "Navigate a persistent named Chromium/Firefox tab and optionally evaluate JavaScript (async IIFEs; Promises awaited). Returns a compact receipt, small eval results/errors, and a snapshot ID. Use web_read for final md, text, html, json, screenshot, or before-screenshot. Only before-screenshot captures pre-eval state, after navigation; no other before formats exist. Large eval results live in snapshot JSON. Inspect HTML first, screenshots for visual evidence. Omit url to preserve the page. Existing sessions keep their engine. Headed by default; missing display is an error. Interrupted running eval closes the Chromium tab or named Firefox process; ordinary eval errors retain the session. Screenshot failures do not discard completed evaluation/content. Saved evidence is bounded and reports omissions.",
+    description: "Navigate one persistent Chromium/Firefox tab per destination and optionally evaluate JavaScript (async IIFEs; Promises awaited). Optional remote selects a named publisher socket; omitted uses PI_BROWSER_REMOTE or launches locally. /browser-remote-setup lists names and prints publisher instructions. Attachment opens its own tab, never takes over human tabs or stops the external browser. Connection failure shows setup instructions and asks for one retry when interactive. Calls to the same destination reuse its tab and engine; use /browser-close [remote] before changing its engine. Omit url to preserve the page. Returns a compact receipt and snapshot ID; web_read reads final md/text/html/json/screenshot or before-screenshot (after navigation, before eval). Inspect HTML first, screenshots for visual evidence. Large eval results live in snapshot JSON. Local launch is headed; missing display is an error. Interrupted eval closes its attached tab, local Chromium tab, or owned Firefox process; uncertain termination is reported. Ordinary eval errors retain the tab. Saved evidence is bounded and reports omissions.",
     parameters: Type.Object({
-      session_id: Type.Optional(Type.String({ description: "Named browser session, default 'default'. Scoped to this Pi session.", pattern: "^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$" })),
-      browser: Type.Optional(StringEnum(["chromium", "firefox"] as const, { description: "Engine for a new session; omitted uses /browser-default or preserves an existing engine." })),
+      browser: Type.Optional(StringEnum(["chromium", "firefox"] as const, { description: "Engine when opening this destination; omitted uses /browser-default (PI_WEB_BROWSER) or preserves its existing engine." })),
+      remote: Type.Optional(Type.String({ description: "Publisher hostname, e.g. void-flip, published by inbound SSH. Defaults to PI_BROWSER_REMOTE, or local launch when unset. Use /browser-remote-setup for discovered names and publisher instructions.", pattern: "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$" })),
       url: Type.Optional(Type.String({ description: "HTTP(S) URL to navigate to before capture/eval. Omit to keep the current page." })),
       eval: Type.Optional(Type.String({ description: "JavaScript expression evaluated once; returned Promises are awaited." })),
     }, { additionalProperties: false }),
-    async execute(_id, params, signal) {
+    async execute(_id, params, signal): Promise<AgentToolResult<BrowserResultDetails>> {
       const combined = signal ? AbortSignal.any([signal, stopped.signal]) : stopped.signal;
       combined.throwIfAborted();
-      const id = params.session_id ?? "default";
-      if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$/.test(id)) throw new Error("Invalid browser session_id.");
+      const remote = params.remote ?? defaultRemote;
+      if (remote !== undefined) validateRemote(remote);
+      const closeCommand = `/browser-close${remote === undefined ? "" : ` ${remote}`}`;
       if (params.browser !== undefined && params.browser !== "chromium" && params.browser !== "firefox") throw new Error("Invalid browser engine.");
       if (params.url !== undefined) {
         const url = new URL(params.url);
         if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) throw new Error("Browser URL must be HTTP(S) without embedded credentials.");
       }
       const defaultBrowser = defaults.getState().effective;
-      const evidence: SnapshotInput = { kind: "browser", metadata: { session_id: id, browser: params.browser ?? defaultBrowser,
+      const evidence: SnapshotInput = { kind: "browser", metadata: { browser: params.browser ?? defaultBrowser,
+        ...(remote === undefined ? {} : { remote }),
         ...(params.url ? { requestedUrl: params.url } : {}), ...(params.eval !== undefined ? { expression: params.eval } : {}) }, warnings: [] };
       try {
-        return await enqueue(id, async () => {
+        return await enqueue(remote, async () => {
           combined.throwIfAborted();
-          let session = sessions.get(id);
-          if (session && params.browser && session.browser !== params.browser) throw new Error(`Session ${id} uses ${session.browser}; choose another session_id rather than closing its browser.`);
-          const browser = session?.browser ?? params.browser ?? defaultBrowser;
+          let session = browsers.get(remote);
+          if (session && params.browser !== undefined && params.browser !== session.target.browser) {
+            throw new Error(`This destination already uses ${session.target.browser}. Use ${closeCommand} before changing its engine.`);
+          }
+          const target = session?.target ?? { browser: params.browser ?? defaultBrowser, ...(remote === undefined ? {} : { remote }) };
+          const browser = target.browser;
+          Object.assign(evidence.metadata, target);
+          if (remote !== undefined && session && (session.owner.closed || session.tab.closed)) {
+            throw new Error(`Remote ${remote} lost its connection or tab. Use ${closeCommand}, then reconnect explicitly. No operation was replayed; previously running JavaScript may continue if termination was not confirmed.`);
+          }
           if (session?.owner.closed) {
             await session.owner.close();
-            sessions.delete(id);
+            browsers.delete(remote);
             session = undefined;
           }
           if (!session) {
-            if (sessions.size + starting >= 8) throw new Error("Eight named browser sessions are already open or starting. Use /browser-close before opening another.");
-            starting++;
+            const owner = remote === undefined
+              ? await launchBrowser({ browser, profileDir: path.join(options.profileDir, browser), headless: options.headless, executable: browser === executableBrowser ? options.executable : undefined })
+              : await connectRemote(remote, browser, combined, options.onSetup);
             try {
-              const owner = await launchBrowser({ browser, profileDir: path.join(options.profileDir, id, browser), headless: options.headless, executable: browser === executableBrowser ? options.executable : undefined });
-              try {
-                combined.throwIfAborted();
-                session = { browser, owner, tab: await owner.openTab() };
-                combined.throwIfAborted();
-                sessions.set(id, session);
-              } catch (error) { await owner.close(); throw error; }
-            } finally { starting--; }
+              combined.throwIfAborted();
+              const tab = await owner.openTab();
+              combined.throwIfAborted();
+              session = { target, owner, tab };
+              browsers.set(remote, session);
+            } catch (error) {
+              await owner.close();
+              throw error;
+            }
           } else if (session.tab.closed) session.tab = await session.owner.openTab();
-          evidence.metadata.browser = session.browser;
+          evidence.metadata.browser = session.target.browser;
           evidence.metadata.tab_id = session.tab.id;
           combined.throwIfAborted();
           if (params.url) await session.tab.navigate(params.url, { signal: combined });
@@ -169,12 +185,12 @@ export function createBrowserTool(options: BrowserToolOptions) {
           const serialized = params.eval === undefined ? undefined : JSON.stringify(evalResult ?? null);
           const preview = serialized === undefined ? undefined : truncateHead(serialized, { maxBytes: 4096, maxLines: 60 });
           const details: BrowserResultDetails = {
-            session_id: id, browser: session.browser, tab_id: session.tab.id, ...info,
+            ...session.target, tab_id: session.tab.id, ...info,
             snapshot: saved.id, available: saved.available, truncated: preview?.truncated ?? false,
             ...(preview ? preview.truncated ? { eval_preview: preview.content } : { eval_result: evalResult ?? null } : {}),
             ...(evalError ? { eval_error: evalError } : {}),
           };
-          const receipt = [`${snapshotSummary(saved)}`, `Session: ${id} (${session.browser})`,
+          const receipt = [`${snapshotSummary(saved)}`, `Browser: ${session.target.browser} (${session.target.remote ? `remote ${session.target.remote}` : "local launch"})`,
             `Page: ${info.title} — ${info.url}`,
             ...(evalError ? [`Evaluation error: ${evalError}`] : preview ? [`Evaluation: ${preview.content}${preview.truncated ? "\n[Evaluation preview truncated; full captured result in web_read json.]" : ""}`] : [])].join("\n");
           const bounded = truncateHead(receipt, { maxBytes: 8 * 1024, maxLines: 100 });
@@ -202,12 +218,13 @@ export function createBrowserTool(options: BrowserToolOptions) {
       stopped.signal.throwIfAborted();
       defaults.setOverride(value);
     },
-    async closeSession(id: string): Promise<void> {
-      return enqueue(id, async () => {
-        const session = sessions.get(id);
-        if (!session) throw new Error(`No browser session named ${id}.`);
+    async closeBrowser(remote = defaultRemote): Promise<void> {
+      if (remote !== undefined) validateRemote(remote);
+      return enqueue(remote, async () => {
+        const session = browsers.get(remote);
+        if (!session) throw new Error(`No browser is open for ${remote === undefined ? "local launch" : `remote ${remote}`}.`);
+        browsers.delete(remote);
         await session.owner.close();
-        sessions.delete(id);
       });
     },
     close(): Promise<void> {
@@ -215,8 +232,8 @@ export function createBrowserTool(options: BrowserToolOptions) {
       stopped.abort(new Error("Browser tools closed."));
       closing = (async () => {
         await Promise.allSettled(queues.values());
-        const results = await Promise.allSettled([...sessions.values()].map(session => session.owner.close()));
-        sessions.clear(); queues.clear();
+        const results = await Promise.allSettled([...browsers.values()].map(session => session.owner.close()));
+        browsers.clear(); queues.clear();
         const errors = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
         if (errors.length) throw new AggregateError(errors, "Browser cleanup failed");
       })();

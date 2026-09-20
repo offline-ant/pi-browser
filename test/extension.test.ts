@@ -220,7 +220,7 @@ test("snapshot copying excludes pending state and rejects links, active locks, a
   await assert.rejects(stat(lock), { code: "ENOENT" }, "failed copies release their own source lock");
 });
 
-test("browser-default routes future calls while retaining named sessions and engine-specific research", { timeout: 90_000 }, async t => {
+test("browser-default retains the destination engine and engine-specific research", { timeout: 90_000 }, async t => {
   const root = await environment(t, { PI_WEB_BACKEND: "browser", PI_WEB_BROWSER: "chromium" });
   let solved = false;
   let corrected!: () => void;
@@ -260,7 +260,7 @@ test("browser-default routes future calls while retaining named sessions and eng
   await host.session.prompt("/browser-default firefox");
   await host.session.prompt("/browser-default status");
   assert.equal(launches.mock.callCount(), 0, "selecting and reporting an engine starts no browser");
-  const firefox = await host.run("browser", { session_id: "retained", url: origin,
+  const firefox = await host.run("browser", { url: origin,
     eval: "document.querySelector('main').textContent = 'Retained manual edit'; document.title = 'Edited Firefox'; document.title" });
   assert.equal(firefox.details.browser, "firefox");
   assert.equal((await host.run("web_fetch", { url: `${origin}/seed` })).details.browser, "firefox");
@@ -275,19 +275,20 @@ test("browser-default routes future calls while retaining named sessions and eng
   assert.equal(attentionNavigations, 1);
 
   await host.session.prompt("/browser-default chromium");
-  const chromium = await host.run("browser", { session_id: "new-default", url: origin });
-  assert.equal(chromium.details.browser, "chromium");
   const chromiumResearch = await host.run("web_fetch", { url: `${origin}/cookies` });
   assert.equal(chromiumResearch.details.browser, "chromium");
   assert.match(JSON.stringify(chromiumResearch.content), /Cookie: none/, "engines have separate research cookies");
-  const retained = await host.run("browser", { session_id: "retained", eval: "document.querySelector('main').textContent" });
+  const retained = await host.run("browser", { eval: "document.querySelector('main').textContent" });
   assert.equal(retained.details.browser, "firefox");
   assert.equal(retained.details.tab_id, firefox.details.tab_id);
   assert.equal(retained.details.title, "Edited Firefox");
   assert.equal(retained.details.eval_result, "Retained manual edit");
-  const explicit = await host.run("browser", { session_id: "explicit", browser: "firefox", url: origin });
-  assert.equal(explicit.details.browser, "firefox", "explicit new-session engine overrides the default");
-  await host.session.prompt("/browser-close explicit");
+  await host.session.prompt("/browser-close");
+  const explicit = await host.run("browser", { browser: "firefox", url: origin });
+  assert.equal(explicit.details.browser, "firefox", "explicit engine overrides the default after closing");
+  await host.session.prompt("/browser-close");
+  const chromium = await host.run("browser", { url: origin });
+  assert.equal(chromium.details.browser, "chromium", "reopening uses the current default");
 
   const beforeCommands = launches.mock.callCount();
   await host.session.prompt("/browser-default firefox");
@@ -306,13 +307,13 @@ test("browser-default routes future calls while retaining named sessions and eng
 
   const base = path.join(root, "browser", host.session.sessionId);
   const owners: { file: string; browserPid: number }[] = [];
-  for (const profile of ["manual/retained/firefox", "manual/new-default/chromium", "research/firefox", "research/chromium"]) {
+  for (const profile of ["manual/chromium", "research/firefox", "research/chromium"]) {
     const file = path.join(base, profile, ".pi-browser-owner", "owner.json");
     const owner = JSON.parse(await readFile(file, "utf8"));
     assert.equal(owner.pid, process.pid);
     owners.push({ file, browserPid: owner.browserPid });
   }
-  assert.equal(new Set(owners.map(owner => owner.browserPid)).size, 4);
+  assert.equal(new Set(owners.map(owner => owner.browserPid)).size, 3);
   await host.close();
   for (const owner of owners) {
     await assert.rejects(stat(owner.file), { code: "ENOENT" });
@@ -400,7 +401,7 @@ for (const browser of ["chromium", "firefox"] as const) {
     const owners: { file: string; browserPid: number }[] = [];
     for (const host of [first, second]) {
       const base = path.join(root, "browser", host.session.sessionId);
-      for (const profile of [path.join(base, "manual", "default", browser), path.join(base, "research", browser)]) {
+      for (const profile of [path.join(base, "manual", browser), path.join(base, "research", browser)]) {
         const file = path.join(profile, ".pi-browser-owner", "owner.json");
         const owner = JSON.parse(await readFile(file, "utf8"));
         assert.equal(owner.pid, process.pid);
