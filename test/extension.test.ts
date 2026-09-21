@@ -9,13 +9,22 @@ import {
   createAgentSession, DefaultResourceLoader, ModelRegistry, ModelRuntime, SessionManager, SettingsManager,
   type CreateAgentSessionOptions, type ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
-import { fauxAssistantMessage, fauxProvider, fauxToolCall, InMemoryCredentialStore, InMemoryModelsStore } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall, InMemoryCredentialStore, InMemoryModelsStore, type JsonObject, type JsonValue } from "@earendil-works/pi-ai";
 import { Check } from "typebox/value";
 import browserExtension from "../src/extension.ts";
 import { BrowserProcessLauncher } from "../src/core/index.ts";
 import { CODEX_ENDPOINT } from "../src/web/codex.ts";
 import { SnapshotStore, WebAttentionRequired } from "../src/web/index.ts";
 import { copySnapshotTree } from "../src/snapshot-copy.ts";
+
+function isJsonObject(value: JsonValue | undefined): value is JsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function snapshotId(result: { details: JsonObject }): string {
+  assert(typeof result.details.snapshot === "string");
+  return result.details.snapshot;
+}
 
 async function environment(t: TestContext, settings: Record<string, string>) {
   const root = await mkdtemp(path.join(tmpdir(), "pi-browser-extension-"));
@@ -66,7 +75,7 @@ async function sdk(root: string, confirm?: ExtensionUIContext["confirm"], option
   return {
     session, definitions, errors,
     snapshots: new SnapshotStore({ directory: path.join(root, "browser", session.sessionId, "snapshots") }),
-    async run(name: string, args: Record<string, unknown>) {
+    async run(name: string, args: JsonObject) {
       fake.setResponses([
         fauxAssistantMessage(fauxToolCall(name, args), { stopReason: "toolUse" }),
         fauxAssistantMessage("Fixture complete."),
@@ -75,7 +84,7 @@ async function sdk(root: string, confirm?: ExtensionUIContext["confirm"], option
       const result = session.messages.findLast(message => message.role === "toolResult");
       assert(result?.role === "toolResult");
       assert.equal(result.isError, false, JSON.stringify(result));
-      return result;
+      return { ...result, details: isJsonObject(result.details) ? result.details : {} };
     },
     async close() {
       await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
@@ -127,10 +136,10 @@ test("snapshot evidence and cursors survive reload and fork without copying prof
   const hosts = [parent];
   t.after(async () => { for (const host of hosts) await host.close(); await rm(root, { recursive: true, force: true }); });
   const fetched = await parent.run("web_fetch", { url: "https://example.com/durable" });
-  const snapshot: string = fetched.details.snapshot;
+  const snapshot = snapshotId(fetched);
   const firstPage = await parent.run("web_read", { snapshot });
-  const cursor: string = firstPage.details.nextCursor;
-  assert(cursor);
+  const cursor = firstPage.details.nextCursor;
+  assert(typeof cursor === "string" && cursor);
   const previousFile = parent.session.sessionFile!;
   const originalSession = parent.session.sessionId;
   await parent.close();
@@ -370,8 +379,8 @@ for (const browser of ["chromium", "firefox"] as const) {
     assert(!("after_html" in firstManual.details));
     assert(!("before_screenshot" in firstManual.details));
     assert(!JSON.stringify(firstManual.content).includes(root));
-    const manualEvidence = await first.snapshots.info(firstManual.details.snapshot);
-    const otherEvidence = await second.snapshots.info(secondManual.details.snapshot);
+    const manualEvidence = await first.snapshots.info(snapshotId(firstManual));
+    const otherEvidence = await second.snapshots.info(snapshotId(secondManual));
     assert.notEqual(path.dirname(manualEvidence.paths.html!), path.dirname(otherEvidence.paths.html!));
     const readOnlyLaunches = launches.mock.callCount();
     const html = await first.run("web_read", { snapshot: firstManual.details.snapshot, format: "html" });
@@ -418,6 +427,6 @@ for (const browser of ["chromium", "firefox"] as const) {
       assert.throws(() => process.kill(owner.browserPid, 0), { code: "ESRCH" });
     }
     assert.match(await readFile(manualEvidence.paths.html!, "utf8"), /Manual edit/);
-    assert.equal((await first.snapshots.read(firstManual.details.snapshot, "screenshot")).image?.mimeType, "image/png", "shutdown preserves evidence");
+    assert.equal((await first.snapshots.read(snapshotId(firstManual), "screenshot")).image?.mimeType, "image/png", "shutdown preserves evidence");
   });
 }
