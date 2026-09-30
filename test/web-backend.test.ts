@@ -4,14 +4,14 @@ import http from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { BrowserResearch } from "../src/web/browser.ts";
 import { CODEX_ENDPOINT } from "../src/web/codex.ts";
 import { createWebTools, isWebBackend, type WebBackend, type WebBackendState, type WebSettings } from "../src/web/index.ts";
 
 const token = `test.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "test-account" } })).toString("base64url")}.test`;
-function context(auth: () => Promise<string | undefined> = async () => token): ExtensionContext {
-  return { modelRegistry: { getApiKeyForProvider: auth }, model: undefined } as unknown as ExtensionContext;
+function context(auth: () => Promise<string | undefined> = async () => token): ExtensionToolContext {
+  return { modelRegistry: { getApiKeyForProvider: auth }, model: undefined } as unknown as ExtensionToolContext;
 }
 
 function deferred<T>() {

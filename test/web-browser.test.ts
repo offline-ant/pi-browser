@@ -4,7 +4,7 @@ import http from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { launchBrowser, type BrowserSession, type BrowserTab } from "../src/core/index.ts";
 import { BrowserResearch, WebAttentionRequired } from "../src/web/browser.ts";
 import { captureExpression, inspectionExpression, type PageInspection } from "../src/web/extract.ts";
@@ -120,11 +120,11 @@ test("real browser DOM extraction preserves shadow code, links, lists, tables, a
       return status === 200 ? Response.json({ output: "Recovered Codex output." }) : new Response("temporarily unavailable", { status });
     });
     const token = `test.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "test" } })).toString("base64url")}.test`;
-    const ctx = { modelRegistry: { getApiKeyForProvider: async () => token }, model: undefined } as unknown as ExtensionContext;
+    const ctx = { modelRegistry: { getApiKeyForProvider: async () => token }, model: undefined } as unknown as ExtensionToolContext;
     const browserOnly = createWebTools({ profileDir: path.join(root, "only"), settings: { backend: "browser", browser: "firefox", headless: true } });
     const auto = createWebTools({ profileDir: path.join(root, "auto"), settings: { backend: "auto", browser: "firefox", headless: true } });
     try {
-      const forbidden = { modelRegistry: { getApiKeyForProvider: async () => { throw new Error("auth must not be called"); } }, model: undefined } as unknown as ExtensionContext;
+      const forbidden = { modelRegistry: { getApiKeyForProvider: async () => { throw new Error("auth must not be called"); } }, model: undefined } as unknown as ExtensionToolContext;
       const spa = await browserOnly.tools[1]!.execute("spa", { url: `${base}/spa` }, undefined, undefined, forbidden);
       assert.equal(spa.details.backend, "browser");
       assert.match(spa.content.map(part => part.type === "text" ? part.text : "").join(""), /Delayed rendered content/);
@@ -138,7 +138,7 @@ test("real browser DOM extraction preserves shadow code, links, lists, tables, a
       const recovered = await auto.tools[1]!.execute("recovered", { url: `${base}/article` }, undefined, undefined, ctx);
       assert.equal(recovered.details.backend, "codex");
       assert.equal(codexCalls, 2);
-      const missing = { modelRegistry: { getApiKeyForProvider: async () => undefined }, model: undefined } as unknown as ExtensionContext;
+      const missing = { modelRegistry: { getApiKeyForProvider: async () => undefined }, model: undefined } as unknown as ExtensionToolContext;
       const unauthenticated = await auto.tools[1]!.execute("missing-auth", { url: `${base}/article` }, undefined, undefined, missing);
       assert.equal(unauthenticated.details.backend, "browser");
       assert.match(unauthenticated.details.fallbackReason ?? "", /No OpenAI Codex OAuth/);

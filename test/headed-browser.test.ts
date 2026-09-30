@@ -4,7 +4,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { createBrowserTool } from "../src/browser-tool.ts";
 import { createWebTools } from "../src/web/index.ts";
 
@@ -33,7 +33,7 @@ for (const browser of ["firefox", "chromium"] as const) {
         await rm(root, { recursive: true, force: true });
       }
     });
-    const ctx = {} as ExtensionContext;
+    const ctx = {} as ExtensionToolContext;
     const signal = AbortSignal.timeout(45_000);
     const result = await manual.tool.execute("headed", { url, eval: "({width:innerWidth,height:innerHeight})" }, signal, undefined, ctx);
     assert.equal(result.details.browser, browser);

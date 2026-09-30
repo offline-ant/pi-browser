@@ -6,7 +6,7 @@ import { createServer, createConnection, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { createBrowserTool } from "../src/browser-tool.ts";
 import { remoteNames, remoteSocketPath } from "../src/browser-remote.ts";
 import { Bidi, object } from "../src/core/bidi.ts";
@@ -95,7 +95,7 @@ test("published Firefox socket: retry once, reuse the destination tab, preserve 
     },
   });
   cleanups.push(() => tools.close());
-  const execute = (params: Parameters<typeof tools.tool.execute>[1]) => tools.tool.execute("fixture", params, undefined, undefined, {} as ExtensionContext);
+  const execute = (params: Parameters<typeof tools.tool.execute>[1]) => tools.tool.execute("fixture", params, undefined, undefined, {} as ExtensionToolContext);
   const first = await execute({ eval: "globalThis.fixtureCount = (globalThis.fixtureCount || 0) + 1" });
   const second = await execute({ remote: "desktop", eval: "++globalThis.fixtureCount" });
   assert.equal(first.details.remote, "desktop", "environment default selects the publisher");

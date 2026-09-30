@@ -3,15 +3,15 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, type TestContext } from "node:test";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { Check } from "typebox/value";
 import { createWebTools, SnapshotStore } from "../src/web/index.ts";
 import { CODEX_ENDPOINT, CodexUnavailable, formatCodex, runCodex } from "../src/web/codex.ts";
 import { resolveWebSettings } from "../src/web/settings.ts";
 
 const token = `test.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "test-account" } })).toString("base64url")}.test`;
-function context(auth: () => Promise<string | undefined> = async () => token): ExtensionContext {
-  return { modelRegistry: { getApiKeyForProvider: auth }, model: undefined } as unknown as ExtensionContext;
+function context(auth: () => Promise<string | undefined> = async () => token): ExtensionToolContext {
+  return { modelRegistry: { getApiKeyForProvider: auth }, model: undefined } as unknown as ExtensionToolContext;
 }
 function isolateCredentials(t: TestContext, directory: string): void {
   const old = process.env.PI_CODING_AGENT_DIR;
@@ -66,7 +66,7 @@ test("Codex web tools preserve request/auth semantics, surface errors, and do no
     assert.equal(request.model, "gpt-5.6-sol");
     assert.equal(request.max_output_tokens, 8000);
     assert.deepEqual(request.settings, { allowed_callers: ["direct"], external_web_access: true });
-    const ctx = { ...context(), model: { provider: "openai-codex", id: "chosen-model" } } as ExtensionContext;
+    const ctx = { ...context(), model: { provider: "openai-codex", id: "chosen-model" } } as ExtensionToolContext;
     const fetched = await fetchTool!.execute("fetch", { url: " https://example.com/article " }, undefined, undefined, ctx);
     assert.equal(fetched.details.model, "chosen-model");
     assert.deepEqual(JSON.parse(String(calls.at(-1)?.init?.body)).commands, { open: [{ ref_id: "https://example.com/article" }], response_length: "long" });

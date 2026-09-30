@@ -3,12 +3,12 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { SnapshotStore } from "../src/snapshots.ts";
 import { BrowserProcessLauncher, publicBrowserError } from "../src/core/process.ts";
 import { createWebTools } from "../src/web/index.ts";
 
-const context = {} as ExtensionContext;
+const context = {} as ExtensionToolContext;
 
 test("JSON preserves fitting long strings and treats undefined object fields as absent", async t => {
   const directory = await mkdtemp(path.join(tmpdir(), "pi-snapshot-json-budget-"));

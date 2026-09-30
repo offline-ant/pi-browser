@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { createBrowserDefault, isBrowserKind, type BrowserDefaultState } from "../src/browser-default.ts";
 import { createBrowserTool } from "../src/browser-tool.ts";
 import { BrowserProcessLauncher, type BrowserKind } from "../src/core/index.ts";
@@ -10,7 +10,7 @@ import { BrowserResearch } from "../src/web/browser.ts";
 import { createWebTools } from "../src/web/index.ts";
 
 const root = path.join(tmpdir(), "pi-browser-default-unit");
-const context = {} as ExtensionContext;
+const context = {} as ExtensionToolContext;
 const result = { output: "Mock research", url: "https://example.test/", title: "Fixture", tabId: "fixture", limitations: [] };
 
 function deferred() {
@@ -129,7 +129,7 @@ test("web engine is snapshotted before Codex authentication yields, including la
     const ctx = { modelRegistry: { getApiKeyForProvider: async () => {
       if (++calls === 1) { entered.resolve(); await release.promise; }
       return undefined;
-    } } } as unknown as ExtensionContext;
+    } } } as unknown as ExtensionToolContext;
     const pending = web.tools[operation.index]!.execute("pending", operation.params, undefined, undefined, ctx);
     await entered.promise;
     web.setBrowserOverride("firefox");

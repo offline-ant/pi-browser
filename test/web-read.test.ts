@@ -3,12 +3,12 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, type TestContext } from "node:test";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { Check } from "typebox/value";
 import { SnapshotStore } from "../src/snapshots.ts";
 import { createWebReadTool } from "../src/web/read.ts";
 
-const context = {} as ExtensionContext;
+const context = {} as ExtensionToolContext;
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=";
 async function fixture(t: TestContext) {
   const directory = await mkdtemp(path.join(tmpdir(), "web-read-test-"));

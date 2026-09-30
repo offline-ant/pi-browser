@@ -118,7 +118,7 @@ test("static registration is lazy, Codex-only never requests a browser, and shut
     assert.equal(transport.mock.callCount(), 2, "web_read makes no transport request");
     assert.equal(launches.mock.callCount(), 0);
     assert.deepEqual(await readdir(path.join(root, "browser", host.session.sessionId)), ["snapshots"], "Codex saves evidence but creates no browser profiles");
-    const context = host.session.extensionRunner.createContext();
+    const context = host.session.extensionRunner.createToolContext("late", undefined);
     await host.session.extensionRunner.emit({ type: "session_shutdown", reason: "reload" });
     const browser = host.definitions.find(tool => tool.name === "browser")!;
     await assert.rejects(async () => browser.execute("late", {}, undefined, undefined, context), /shut down/);
@@ -185,7 +185,7 @@ test("failed snapshot fork blocks tools instead of silently starting an empty st
   assert.match(host.errors[0]!, /operation lock/);
   host.errors.length = 0;
   const read = host.definitions.find(tool => tool.name === "web_read")!;
-  await assert.rejects(read.execute("locked", { snapshot: saved.id }, undefined, undefined, host.session.extensionRunner.createContext()), /operation lock/);
+  await assert.rejects(read.execute("locked", { snapshot: saved.id }, undefined, undefined, host.session.extensionRunner.createToolContext("locked", undefined)), /operation lock/);
   await assert.rejects(stat(host.snapshots.directory), { code: "ENOENT" });
 });
 
@@ -276,7 +276,7 @@ test("browser-default retains the destination engine and engine-specific researc
   const fetchTool = host.definitions.find(tool => tool.name === "web_fetch")!;
   let pendingTab = "";
   await assert.rejects(fetchTool.execute("attention", { url: `${origin}/attention` }, undefined, undefined,
-    host.session.extensionRunner.createContext()), error => {
+    host.session.extensionRunner.createToolContext("attention", undefined)), error => {
     assert(error instanceof WebAttentionRequired);
     pendingTab = error.tabId;
     return true;
@@ -394,7 +394,7 @@ for (const browser of ["chromium", "firefox"] as const) {
     assert.equal(launches.mock.callCount(), readOnlyLaunches, "saved HTML/image reads never launch another browser");
     const noUIFetch = second.definitions.find(tool => tool.name === "web_fetch")!;
     await assert.rejects(noUIFetch.execute("no-ui", { url: `${origin}/attention` }, undefined, undefined,
-      second.session.extensionRunner.createContext()), WebAttentionRequired);
+      second.session.extensionRunner.createToolContext("no-ui", undefined)), WebAttentionRequired);
     const attention = await first.run("web_fetch", { url: `${origin}/attention` });
     assert.equal(attention.details.backend, "browser");
     assert.match(JSON.stringify(attention.content), /Human supplied readable article/);

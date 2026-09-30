@@ -5,12 +5,12 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { Check } from "typebox/value";
 import { createBrowserTool } from "../src/browser-tool.ts";
 import { BrowserProcessLauncher } from "../src/core/index.ts";
 
-const context = {} as ExtensionContext;
+const context = {} as ExtensionToolContext;
 type Params = Parameters<ReturnType<typeof createBrowserTool>["tool"]["execute"]>[1];
 
 function deferred() {
