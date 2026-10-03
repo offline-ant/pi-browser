@@ -135,7 +135,7 @@ export class BrowserResearch {
         if (!headless) await tab.focus();
       }
       evidence.metadata.tab = tab.name;
-      const activeTab = tab;
+      let activeTab = tab;
       let deadline = Date.now() + 12_000;
       let earliest = Date.now() + 800;
       let stableSince = Date.now();
@@ -145,8 +145,12 @@ export class BrowserResearch {
         const request = { id: randomUUID(), reason: headless ? `${reason} The research browser is headless: no visible window is available; only a host-provided programmatic intervention can correct this live page.` : reason, url, tab: activeTab.name };
         progress?.(`Needs attention: ${request.reason} (${url})`);
         if (!attention) throw new WebAttentionRequired(reason, activeTab.name, url, headless);
+        // Not using the tab while a person works: others may inspect or correct it meanwhile.
+        await activeTab.release();
+        tab = undefined;
         const continued = await abortable(Promise.resolve().then(() => attention(request, signal)), signal);
         signal.throwIfAborted();
+        tab = activeTab = (await this.client.open({ id: activeTab.id }, signal)).tab;
         if (!continued) throw new WebAttentionRequired("Web operation cancelled; the page was left intact.", activeTab.name, url, headless);
         // Never replay navigation over a human's sign-in, challenge solution, or correction.
         deadline = Date.now() + 12_000;

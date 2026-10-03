@@ -102,7 +102,8 @@ recent is that session's default tab. At every request and disconnect it closes
 Pi-opened tabs that are in no connected session's list. There is no ownership:
 any session can list and use any tab. Using a tab another session used since your
 last use returns a warning. Each `browser`, `web_search`, or `web_fetch` call holds
-its tab exclusively from resolving it to its final capture, so calls on one tab,
+its tab exclusively from resolving it to its final capture (research releases it
+while waiting for human intervention), so calls on one tab,
 from any session, run one after another; a cancelled waiting call releases nothing,
 and a disconnecting session releases its tabs. Different tabs run in parallel. Interrupting running JavaScript closes that tab in either engine
 (Chromium stops the script first); if closure fails, a launched browser is stopped
