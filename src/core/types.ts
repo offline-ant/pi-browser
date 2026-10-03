@@ -13,7 +13,6 @@ export interface BrowserOptions {
 
 /** Connect to an external browser without owning its process or profile. */
 export interface BrowserConnectOptions {
-  browser: BrowserKind;
   /** Unix socket forwarding to the publisher's 127.0.0.1:9222 debugging port. */
   socketPath: string;
   signal?: AbortSignal;
@@ -27,7 +26,12 @@ export interface OperationOptions {
 export interface BrowserSession {
   /** True once cleanup starts or the connection/owned process is lost. */
   readonly closed: boolean;
+  readonly browser: BrowserKind;
   openTab(url?: string): Promise<BrowserTab>;
+  /** Top-level pages, including ones opened by people or pages. */
+  pages(): Promise<{ id: string; url: string; title?: string }[]>;
+  /** Use an existing page; attached pages are not closed by close(). */
+  tab(id: string): Promise<BrowserTab>;
   /** Close owned tabs; stop the browser only when this session launched it. */
   close(): Promise<void>;
 }

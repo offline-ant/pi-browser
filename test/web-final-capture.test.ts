@@ -4,11 +4,12 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, type TestContext } from "node:test";
 import { capturePage, type PageCapture } from "../src/capture.ts";
-import type { BrowserTab, OperationOptions } from "../src/core/index.ts";
+import type { OperationOptions } from "../src/core/index.ts";
 import { SnapshotStore, type SnapshotInfo } from "../src/snapshots.ts";
 import { BrowserResearch, WebAttentionRequired } from "../src/web/browser.ts";
 import { captureExpression, inspectionExpression, type PageInspection } from "../src/web/extract.ts";
 import { resolveWebSettings } from "../src/web/settings.ts";
+import { fixtureClient, type ResearchTab } from "./helpers.ts";
 
 const inspect = (patch: Partial<PageInspection> = {}): PageInspection => ({
   url: "https://example.test/polled", title: "Polled page", ready: true, noResults: false,
@@ -27,12 +28,10 @@ async function fixture(t: TestContext, kind: "search" | "fetch" = "fetch") {
     captures: 0, screenshots: 0, navigations: 0,
     onCapture: undefined as ((options: OperationOptions) => Promise<PageCapture>) | undefined,
   };
-  const tab: BrowserTab = {
-    id: "final-capture", closed: false,
+  const tab: ResearchTab = {
+    name: "final-capture", closed: false,
     navigate: async () => { state.navigations++; },
-    focus: async () => {}, close: async () => {},
-    info: async () => { throw new Error("Live metadata must not be read"); },
-    html: async () => { throw new Error("Live HTML must not be read"); },
+    focus: async () => {},
     screenshot: async () => { state.screenshots++; throw new Error("Screenshot deliberately unavailable"); },
     evaluate: async (expression, options = {}) => {
       if (expression === captureExpression(kind, "bing")) {
@@ -44,9 +43,7 @@ async function fixture(t: TestContext, kind: "search" | "fetch" = "fetch") {
       return state.poll;
     },
   };
-  const research = new BrowserResearch(resolveWebSettings({ searchEngine: "bing", headless: true }, {}), async () => ({
-    closed: false, openTab: async () => tab, close: async () => {},
-  }), snapshots);
+  const research = new BrowserResearch(resolveWebSettings({ searchEngine: "bing" }, {}), fixtureClient(() => tab, true), snapshots);
   t.after(async () => { await research.close(); await rm(directory, { recursive: true, force: true }); });
   const json = async (snapshot: SnapshotInfo) => JSON.parse(JSON.parse((await snapshots.read(snapshot.id, "json")).text!).chunk);
   return { state, research, snapshots, json, tab };

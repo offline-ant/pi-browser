@@ -3,8 +3,7 @@ import {
   type AgentToolUpdateCallback, type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "typebox";
-import type { BrowserKind } from "../core/types.ts";
-import { createBrowserDefault, type BrowserDefault, type BrowserDefaultState } from "../browser-default.ts";
+import type { BrowserClient } from "../broker/client.ts";
 
 import { validateWebUrl } from "./async.ts";
 import { BrowserResearch } from "./browser.ts";
@@ -13,7 +12,9 @@ import { SnapshotStore, snapshotSummary, type SnapshotInfo } from "../snapshots.
 import { createWebReadTool } from "./read.ts";
 import { isWebBackend, resolveWebSettings, type AttentionHandler, type WebBackend, type WebBackendState, type WebSettings } from "./settings.ts";
 
-export { createBrowserDefault, isBrowserKind, type BrowserDefault, type BrowserDefaultState } from "../browser-default.ts";
+export { BrowserClient, BrowserUnavailable, SharedTab, type BrowserClientOptions } from "../broker/client.ts";
+export { browserHeadless } from "../browser-selection.ts";
+export type { BrowserSource, TabInfo } from "../broker/protocol.ts";
 export { SnapshotStore, snapshotSummary, type SnapshotFormat, type SnapshotInput, type SnapshotInfo, type SnapshotRead } from "../snapshots.ts";
 export { createWebReadTool } from "./read.ts";
 
@@ -21,9 +22,9 @@ export { isWebBackend, resolveWebSettings, type WebBackend, type WebBackendState
 export { WebAttentionRequired } from "./browser.ts";
 
 export interface WebToolsOptions {
-  profileDir?: string;
   settings?: Partial<WebSettings>;
-  browserDefault?: BrowserDefault;
+  /** The shared browser for research, resolved per call; owned and closed by the host. */
+  browser?: () => BrowserClient | Promise<BrowserClient>;
   snapshots?: SnapshotStore;
   onAttention?: AttentionHandler;
   onProgress?: (message: string) => void;
@@ -34,8 +35,6 @@ export interface WebToolSet {
   snapshots: SnapshotStore;
   getBackendState(): WebBackendState;
   setBackendOverride(value: WebBackend | null): void;
-  getBrowserState(): BrowserDefaultState;
-  setBrowserOverride(value: BrowserKind | null): void;
   close(): Promise<void>;
 }
 
@@ -49,9 +48,9 @@ export interface WebResultDetails {
   query?: string;
   model?: string;
   endpoint?: string;
-  browser?: "chromium" | "firefox";
   searchEngine?: "duckduckgo" | "bing" | "brave";
-  tabId?: string;
+  /** Research tab name in the shared browser; usable with the browser tool. */
+  tab?: string;
   limitations?: string[];
   snapshot?: string;
   available?: SnapshotInfo["available"];
@@ -61,13 +60,12 @@ export interface WebResultDetails {
 
 /** Reusable definitions for Pi registerTool and SDK customTools. No resource discovery or page-supplied host code. */
 export function createWebTools(options: WebToolsOptions = {}): WebToolSet {
-  const settings = resolveWebSettings(options.settings, process.env, options.profileDir);
+  const settings = resolveWebSettings(options.settings);
   const snapshots = options.snapshots ?? new SnapshotStore();
   const configured = settings.backend;
   const configuredSource = options.settings?.backend != null ? "host" : process.env.PI_WEB_BACKEND !== undefined ? "environment" : "default";
   let backendOverride: WebBackend | null = null;
-  const defaults = options.browserDefault ?? createBrowserDefault({ browser: options.settings?.browser });
-  const research = new Map<BrowserKind, BrowserResearch>();
+  const research = new Map<BrowserClient, BrowserResearch>();
   const stopped = new AbortController();
   const running = new Set<Promise<unknown>>();
   let closing: Promise<void> | undefined;
@@ -81,7 +79,8 @@ export function createWebTools(options: WebToolsOptions = {}): WebToolSet {
   async function run(kind: "search" | "fetch", value: string, maxResults: number, signal: AbortSignal | undefined, onUpdate: AgentToolUpdateCallback<WebResultDetails> | undefined, context: ExtensionContext) {
     // Snapshot before auth, transport, browser queuing, or human intervention can yield.
     const backend = backendOverride ?? configured;
-    const browser = defaults.getState().effective;
+    const browser = backend === "codex" || !options.browser ? undefined : Promise.resolve().then(options.browser);
+    void browser?.catch(() => {});
     const combined = signal ? AbortSignal.any([signal, stopped.signal]) : stopped.signal;
     combined.throwIfAborted();
     const progress = (message: string) => {
@@ -114,16 +113,17 @@ export function createWebTools(options: WebToolsOptions = {}): WebToolSet {
         progress(`Codex unavailable; falling back to the browser. ${fallbackReason}`);
       }
     }
-    let engineResearch = research.get(browser);
-    if (!engineResearch) {
-      engineResearch = new BrowserResearch({ ...settings, browser,
-        executable: browser === settings.browser ? settings.executable : undefined }, undefined, snapshots);
-      research.set(browser, engineResearch);
+    if (!browser) throw new Error(`Browser research is unavailable: this host supplied no browser.${fallbackReason ? ` ${fallbackReason}` : ""}`);
+    const client = await browser;
+    let clientResearch = research.get(client);
+    if (!clientResearch) {
+      clientResearch = new BrowserResearch(settings, client, snapshots);
+      research.set(client, clientResearch);
     }
-    const result = await engineResearch.run(kind, value, maxResults, combined, options.onAttention, progress);
+    const result = await clientResearch.run(kind, value, maxResults, combined, options.onAttention, progress);
     return formatted(result.output, {
-      backend: "browser", browser, retrievedAt: new Date().toISOString(), truncated: false,
-      url: result.url, title: result.title, tabId: result.tabId, limitations: result.limitations,
+      backend: "browser", retrievedAt: new Date().toISOString(), truncated: false,
+      url: result.url, title: result.title, tab: result.tab, limitations: result.limitations,
       ...(kind === "search" ? { query: value, searchEngine: settings.searchEngine, sourceCount: result.sourceCount, returnedCount: result.results?.length } : {}),
       ...(fallbackReason === undefined ? {} : { fallbackReason }),
     }, result.snapshot);
@@ -131,10 +131,11 @@ export function createWebTools(options: WebToolsOptions = {}): WebToolSet {
 
   function formatted(output: string, details: WebResultDetails, snapshot?: SnapshotInfo) {
     const header = [
-      `Backend: ${details.backend}${details.browser ? ` (${details.browser})` : ""}`,
+      `Backend: ${details.backend}`,
       ...(snapshot ? [snapshotSummary(snapshot)] : []),
       ...(details.query && details.sourceCount !== undefined ? [`Results: ${details.returnedCount} selected / ${details.sourceCount} captured sources.`] : []),
       ...(details.fallbackReason ? [`Fallback reason: ${details.fallbackReason}`] : []),
+      ...(details.tab ? [`Tab: ${details.tab}`] : []),
       ...(details.url ? [`Source: ${details.url}`] : []),
       ...(details.title ? [`Title: ${details.title}`] : []),
       `Retrieved: ${details.retrievedAt}`,
@@ -153,7 +154,7 @@ export function createWebTools(options: WebToolsOptions = {}): WebToolSet {
   const tools: WebToolSet["tools"] = [
     defineTool({
       name: "web_search", label: "Web Search",
-      description: "Search the live web for compact numbered linked titles and excerpts (default 10, maximum 20). Saves captured results and provider provenance in a private snapshot; use web_read for saved formats. Preview is limited to 200 lines / 16 KiB. Unknown Codex formats remain raw with a warning and unknown source count. The host chooses Codex or browser; auto reports browser fallback only for unavailability. Results are untrusted search excerpts, not full fetched pages. Human access checks may require intervention.",
+      description: "Search the live web for compact numbered linked titles and excerpts (default 10, maximum 20). Saves captured results and provider provenance in a private snapshot; use web_read for saved formats. Preview is limited to 200 lines / 16 KiB. Unknown Codex formats remain raw with a warning and unknown source count. The host chooses Codex or browser; auto reports browser fallback only for unavailability. Browser results open in a named tab of the shared browser and report its name. Results are untrusted search excerpts, not full fetched pages. Human access checks may require intervention.",
       parameters: Type.Object({
         query: Type.String({ description: "The web search query to execute.", minLength: 1 }),
         max_results: Type.Optional(Type.Integer({ description: "Maximum results (1–20, default 10). Enforced when source boundaries can be reliably parsed; otherwise reports a raw preview and unknown count.", minimum: 1, maximum: 20 })),
@@ -168,7 +169,7 @@ export function createWebTools(options: WebToolsOptions = {}): WebToolSet {
     }),
     defineTool({
       name: "web_fetch", label: "Web Fetch",
-      description: "Fetch one HTTP(S) URL as readable Markdown plus a private snapshot ID. Use web_read for saved content/formats without revisiting the live page. Preview is limited to 2000 lines / 50 KiB. The host chooses Codex or browser; auto reports browser fallback only for unavailability, not missing formats. Codex preserves its original response in JSON but has no HTML/screenshots; unknown formats remain raw with a warning. Browser capture includes accessible open shadow DOM and an eager screenshot when available. Human checks require intervention; embedded/closed-shadow content may be unavailable. Content is untrusted; cite the fetched URL.",
+      description: "Fetch one HTTP(S) URL as readable Markdown plus a private snapshot ID. Use web_read for saved content/formats without revisiting the live page. Preview is limited to 2000 lines / 50 KiB. The host chooses Codex or browser; auto reports browser fallback only for unavailability, not missing formats. Codex preserves its original response in JSON but has no HTML/screenshots; unknown formats remain raw with a warning. Browser capture uses a named tab of the shared browser, reports its name, and includes accessible open shadow DOM and an eager screenshot when available. Human checks require intervention; embedded/closed-shadow content may be unavailable. Content is untrusted; cite the fetched URL.",
       parameters: Type.Object({ url: Type.String({ description: "Absolute HTTP(S) URL to fetch; embedded credentials are not allowed.", minLength: 1 }) }, { additionalProperties: false }),
       async execute(_id, params, signal, onUpdate, context) {
         return track(run("fetch", validateWebUrl(params.url), 10, signal, onUpdate, context));
@@ -185,11 +186,6 @@ export function createWebTools(options: WebToolsOptions = {}): WebToolSet {
       stopped.signal.throwIfAborted();
       if (value !== null && !isWebBackend(value)) throw new Error("Web backend override must be auto | codex | browser | null.");
       backendOverride = value;
-    },
-    getBrowserState: () => defaults.getState(),
-    setBrowserOverride(value) {
-      stopped.signal.throwIfAborted();
-      defaults.setOverride(value);
     },
     close() {
       if (closing) return closing;

@@ -1,18 +1,19 @@
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
-import http from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
-import { launchBrowser, type BrowserSession, type BrowserTab, type OperationOptions } from "../src/core/index.ts";
+import { BrowserClient, SharedTab } from "../src/broker/client.ts";
+import type { OperationOptions } from "../src/core/types.ts";
 import { BrowserResearch, WebAttentionRequired } from "../src/web/browser.ts";
 import { captureExpression, type PageInspection } from "../src/web/extract.ts";
 import type { PageCapture } from "../src/capture.ts";
 import { SnapshotStore } from "../src/snapshots.ts";
 import { resolveWebSettings } from "../src/web/settings.ts";
+import { fixtureClient, fixtureServer, isolateBrokers, type ResearchTab } from "./helpers.ts";
 
-class FixtureTab implements BrowserTab {
-  readonly id: string;
+class FixtureTab implements ResearchTab {
+  readonly name: string;
   closed = false;
   navigations = 0;
   focuses = 0;
@@ -23,7 +24,7 @@ class FixtureTab implements BrowserTab {
   captures = 0;
   screenshots = 0;
   results: PageInspection["results"] = [];
-  constructor(id: string) { this.id = id; }
+  constructor(name: string) { this.name = name; }
   async navigate(): Promise<void> { assert.equal(this.closed, false); this.navigations++; }
   async evaluate(expression: string): Promise<PageInspection | PageCapture> {
     assert.equal(this.closed, false);
@@ -36,40 +37,35 @@ class FixtureTab implements BrowserTab {
     if (this.error) throw this.error;
     return inspection;
   }
-  async info() { return { url: "https://example.com/", title: "Fixture" }; }
   async screenshot() {
     this.screenshots++;
     if (this.screenshotError) throw this.screenshotError;
     return "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aP1cAAAAASUVORK5CYII=";
   }
-  async html() { return ""; }
   async focus() { this.focuses++; }
   async close() { this.closed = true; }
 }
 
-class FixtureBrowser implements BrowserSession {
-  closed = false;
+class Fixtures {
   tabs: FixtureTab[] = [];
-  async openTab(): Promise<FixtureTab> {
-    assert.equal(this.closed, false);
-    const tab = new FixtureTab(`fixture-${this.tabs.length}`);
-    this.tabs.push(tab);
-    return tab;
+  client(headless = false) {
+    return fixtureClient(() => {
+      const tab = new FixtureTab(`fixture-${this.tabs.length}`);
+      this.tabs.push(tab);
+      return tab;
+    }, headless);
   }
-  async close() { this.closed = true; await Promise.all(this.tabs.map(tab => tab.close())); }
 }
 
 test("closed pending tab is replaced only on the next call, preserving sibling tabs", async t => {
-  const browser = new FixtureBrowser();
-  let launches = 0;
-  const research = new BrowserResearch(resolveWebSettings({}, {}), async () => { launches++; return browser; });
+  const browser = new Fixtures();
+  const research = new BrowserResearch(resolveWebSettings({}, {}), browser.client());
   t.after(() => research.close());
   await assert.rejects(research.run("fetch", "https://example.com/a", 5), WebAttentionRequired);
   await assert.rejects(research.run("fetch", "https://example.com/b", 5), WebAttentionRequired);
   await browser.tabs[0]!.close();
   const messages: string[] = [];
   await assert.rejects(research.run("fetch", "https://example.com/a", 5, undefined, undefined, message => messages.push(message)), WebAttentionRequired);
-  assert.equal(launches, 1);
   assert.equal(browser.tabs.length, 3);
   assert.equal(browser.tabs[1]!.closed, false);
   assert.equal(browser.tabs[2]!.navigations, 1);
@@ -77,25 +73,9 @@ test("closed pending tab is replaced only on the next call, preserving sibling t
   assert.ok(messages.every(message => !/Resuming/.test(message)));
 });
 
-test("closed process releases cached handles and relaunches once on a fresh call", async t => {
-  const browsers: FixtureBrowser[] = [];
-  const research = new BrowserResearch(resolveWebSettings({}, {}), async () => {
-    const browser = new FixtureBrowser(); browsers.push(browser); return browser;
-  });
-  t.after(() => research.close());
-  await assert.rejects(research.run("fetch", "https://example.com/a", 5), WebAttentionRequired);
-  await browsers[0]!.close();
-  const messages: string[] = [];
-  await assert.rejects(research.run("fetch", "https://example.com/a", 5, undefined, undefined, message => messages.push(message)), WebAttentionRequired);
-  assert.equal(browsers.length, 2);
-  assert.equal(browsers[1]!.tabs[0]!.navigations, 1);
-  assert.ok(messages.some(message => /fresh browser\/tab/.test(message)));
-  assert.ok(messages.every(message => !/Resuming/.test(message)));
-});
-
 test("each attention wait has a fresh ID, including an unchanged challenge and a later retry", async t => {
-  const browser = new FixtureBrowser();
-  const research = new BrowserResearch(resolveWebSettings({}, {}), async () => browser);
+  const browser = new Fixtures();
+  const research = new BrowserResearch(resolveWebSettings({}, {}), browser.client());
   t.after(() => research.close());
   const ids: string[] = [];
   await assert.rejects(research.run("fetch", "https://example.com/", 5, undefined, async request => {
@@ -110,54 +90,23 @@ test("each attention wait has a fresh ID, including an unchanged challenge and a
   assert.equal(browser.tabs[0]!.navigations, 1);
 });
 
-test("headless attention reports missing visible window and does not pretend to focus one", async t => {
-  const browser = new FixtureBrowser();
-  const research = new BrowserResearch(resolveWebSettings({ headless: true }, {}), async () => browser);
+test("headless attention reports missing visible window and focuses only to render captures", async t => {
+  const browser = new Fixtures();
+  const research = new BrowserResearch(resolveWebSettings({}, {}), browser.client(true));
   t.after(() => research.close());
   await assert.rejects(research.run("fetch", "https://example.com/", 5), /headless; no visible window/);
   let reason = "";
   await assert.rejects(research.run("fetch", "https://example.com/", 5, undefined, async request => { reason = request.reason; return false; }), WebAttentionRequired);
   assert.match(reason, /headless: no visible window/);
-  assert.equal(browser.tabs[0]!.focuses, 0);
-});
-
-test("research tabs have a hard bound without evicting unfinished attention pages", async t => {
-  const browser = new FixtureBrowser();
-  const research = new BrowserResearch(resolveWebSettings({}, {}), async () => browser);
-  t.after(() => research.close());
-  for (let index = 0; index < 8; index++) await assert.rejects(research.run("fetch", `https://example.com/${index}`, 5), WebAttentionRequired);
-  await assert.rejects(research.run("fetch", "https://example.com/overflow", 5), /All 8 research tabs have unfinished operations/);
-  assert.equal(browser.tabs.length, 8);
-  assert.ok(browser.tabs.every(tab => !tab.closed));
-  // An existing request remains usable even when no new tab can be reserved.
-  await assert.rejects(research.run("fetch", "https://example.com/0", 5), WebAttentionRequired);
-  assert.equal(browser.tabs[0]!.navigations, 1);
-  await browser.tabs[0]!.close();
-  await assert.rejects(research.run("fetch", "https://example.com/overflow", 5), WebAttentionRequired);
-  assert.equal(browser.tabs.filter(tab => !tab.closed).length, 8);
-});
-
-test("completed history is small, while pending pages remain intact", async t => {
-  const browser = new FixtureBrowser();
-  const research = new BrowserResearch(resolveWebSettings({}, {}), async () => browser);
-  t.after(() => research.close());
-  await assert.rejects(research.run("fetch", "https://example.com/pending", 5), WebAttentionRequired);
-  for (let index = 0; index < 5; index++) await research.run("fetch", `https://example.com/${index}`, 5, undefined, async () => {
-    browser.tabs.at(-1)!.attention = false; return true;
-  });
-  assert.equal(browser.tabs[0]!.closed, false);
-  assert.equal(browser.tabs.filter(tab => !tab.closed).length, 4);
-  assert.equal(browser.tabs[1]!.closed, true);
-  assert.equal(browser.tabs[2]!.closed, true);
+  assert.equal(browser.tabs[0]!.focuses, browser.tabs[0]!.screenshots);
 });
 
 test("ordinary errors and progress exceptions are propagated without automatic retries", async t => {
-  const browser = new FixtureBrowser();
-  let launches = 0;
-  const research = new BrowserResearch(resolveWebSettings({}, {}), async () => { launches++; return browser; });
+  const browser = new Fixtures();
+  const research = new BrowserResearch(resolveWebSettings({}, {}), browser.client());
   t.after(() => research.close());
   await assert.rejects(research.run("fetch", "https://example.com/", 5, undefined, undefined, () => { throw new Error("progress callback failed"); }), /progress callback failed/);
-  assert.equal(launches, 0);
+  assert.equal(browser.tabs.length, 0);
   await assert.rejects(research.run("fetch", "https://example.com/", 5), WebAttentionRequired);
   const tab = browser.tabs[0]!;
   tab.error = new Error("ordinary inspection failed");
@@ -167,23 +116,18 @@ test("ordinary errors and progress exceptions are propagated without automatic r
   assert.equal(tab.closed, false);
 });
 
-test("cancellation during tab creation discards the unvisited tab instead of resuming blank content", async t => {
+test("cancellation after opening a tab leaves it unvisited and never resumes blank content", async t => {
   const controller = new AbortController();
-  const browser = new FixtureBrowser();
-  let first = true;
-  const research = new BrowserResearch(resolveWebSettings({}, {}), async () => ({
-    get closed() { return browser.closed; },
-    close: () => browser.close(),
-    openTab: async () => {
-      const tab = await browser.openTab();
-      if (first) { first = false; controller.abort(new Error("cancelled while opening")); }
-      return tab;
-    },
+  const browser = new Fixtures();
+  const client = browser.client();
+  const research = new BrowserResearch(resolveWebSettings({}, {}), fixtureClient(async () => {
+    const { tab } = await client.open({});
+    if (browser.tabs.length === 1) controller.abort(new Error("cancelled while opening"));
+    return tab;
   }));
   t.after(() => research.close());
   await assert.rejects(research.run("fetch", "https://example.com/", 5, controller.signal), /cancelled while opening/);
   await assert.rejects(research.run("fetch", "https://example.com/", 5), WebAttentionRequired);
-  assert.equal(browser.tabs[0]!.closed, true);
   assert.equal(browser.tabs[0]!.navigations, 0);
   assert.equal(browser.tabs[1]!.navigations, 1);
 });
@@ -191,8 +135,8 @@ test("cancellation during tab creation discards the unvisited tab instead of res
 test("queued cancellation saves diagnostics without releasing the active browser queue or mutating its reason", { timeout: 5000 }, async t => {
   const directory = await mkdtemp(path.join(tmpdir(), "pi-web-queue-"));
   const snapshots = new SnapshotStore({ directory: path.join(directory, "snapshots") });
-  const browser = new FixtureBrowser();
-  const research = new BrowserResearch(resolveWebSettings({}, {}), async () => browser, snapshots);
+  const browser = new Fixtures();
+  const research = new BrowserResearch(resolveWebSettings({}, {}), browser.client(), snapshots);
   let ready!: () => void;
   const waiting = new Promise<void>(resolve => { ready = resolve; });
   let release!: (continued: boolean) => void;
@@ -220,8 +164,8 @@ test("queued cancellation saves diagnostics without releasing the active browser
 test("browser snapshots eagerly save full captured results and evidence, including nonfatal screenshot failures", async t => {
   const directory = await mkdtemp(path.join(tmpdir(), "pi-web-producer-"));
   const snapshots = new SnapshotStore({ directory: path.join(directory, "snapshots") });
-  const browser = new FixtureBrowser();
-  const research = new BrowserResearch(resolveWebSettings({}, {}), async () => browser, snapshots);
+  const browser = new Fixtures();
+  const research = new BrowserResearch(resolveWebSettings({}, {}), browser.client(), snapshots);
   t.after(async () => { await research.close(); await rm(directory, { recursive: true, force: true }); });
   const result = await research.run("search", "fixture", 10, undefined, async () => {
     const tab = browser.tabs.at(-1)!;
@@ -262,8 +206,8 @@ test("browser snapshots eagerly save full captured results and evidence, includi
 test("browser failures retain diagnostic snapshots and completed captures without replaying navigation", async t => {
   const directory = await mkdtemp(path.join(tmpdir(), "pi-web-producer-error-"));
   const snapshots = new SnapshotStore({ directory: path.join(directory, "snapshots") });
-  const browser = new FixtureBrowser();
-  const research = new BrowserResearch(resolveWebSettings({}, {}), async () => browser, snapshots);
+  const browser = new Fixtures();
+  const research = new BrowserResearch(resolveWebSettings({}, {}), browser.client(), snapshots);
   t.after(async () => { await research.close(); await rm(directory, { recursive: true, force: true }); });
   let failure: unknown;
   try { await research.run("fetch", "https://example.test/", 10); } catch (error) { failure = error; }
@@ -283,64 +227,38 @@ test("browser failures retain diagnostic snapshots and completed captures withou
   assert.equal(tab.navigations, 1);
 });
 
-test("real Chromium/Firefox evaluation cancellation permits a later web call to recover", async t => {
-  const root = await mkdtemp(path.join(tmpdir(), "pi-browser-web-recovery-"));
-  const server = http.createServer((_request, response) => {
+test("real Chromium/Firefox evaluation cancellation closes the research tab; a later call opens a fresh one", { timeout: 90_000 }, async t => {
+  const root = await isolateBrokers(t);
+  let started!: () => void;
+  let ready = new Promise<void>(resolve => { started = resolve; });
+  const url = `${await fixtureServer(t, (request, response) => {
+    if (request.url === "/started") { started(); response.end(); return; }
     response.setHeader("Content-Type", "text/html");
     response.end("<!doctype html><title>Recovered page</title><main><h1>Recovered page</h1><p>This is the recovered document.</p></main>");
-  });
-  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-  const address = server.address();
-  if (!address || typeof address === "string") throw new Error("No fixture port");
-  const url = `http://127.0.0.1:${address.port}/`;
-  t.after(async () => {
-    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
-    await rm(root, { recursive: true, force: true });
-  });
+  })}/`;
   for (const engine of ["chromium", "firefox"] as const) {
-    await t.test(engine, async () => {
-      let launches = 0;
-      let hang = true;
-      let started!: () => void;
-      const ready = new Promise<void>(resolve => { started = resolve; });
-      const research = new BrowserResearch(resolveWebSettings({ browser: engine, headless: true, profileDir: path.join(root, engine) }, {}), async options => {
-        launches++;
-        const browser = await launchBrowser({ ...options, ...(engine === "chromium" && process.env.PAGENT_TEST_NO_SANDBOX === "1" ? { noSandbox: true } : {}) });
-        return {
-          get closed() { return browser.closed; },
-          close: () => browser.close(),
-          openTab: async input => {
-            const tab = await browser.openTab(input);
-            return {
-              id: tab.id, get closed() { return tab.closed; },
-              navigate: (target: string, options?: OperationOptions) => tab.navigate(target, options),
-              evaluate: (expression: string, options?: OperationOptions) => {
-                if (!hang) return tab.evaluate(expression, options);
-                hang = false;
-                const pending = tab.evaluate("new Promise(() => {})", options);
-                // Ensure the actual evaluation has begun before cancelling.
-                setTimeout(started, 100);
-                return pending;
-              },
-              info: () => tab.info(), screenshot: () => tab.screenshot(), html: () => tab.html(), focus: () => tab.focus(), close: () => tab.close(),
-            };
-          },
-        };
+    await t.test(engine, async t => {
+      const client = new BrowserClient({ source: { browser: engine, profileDir: path.join(root, engine), headless: true }, session: "research", idleMs: 300 });
+      const research = new BrowserResearch(resolveWebSettings({}, {}), client);
+      t.after(async () => { await research.close(); await client.close(); });
+      ready = new Promise<void>(resolve => { started = resolve; });
+      const evaluate = SharedTab.prototype.evaluate;
+      const hung = t.mock.method(SharedTab.prototype, "evaluate", function (this: SharedTab, _expression: string, options?: OperationOptions) {
+        hung.mock.restore();
+        // The page reports that the evaluation is running before it is cancelled.
+        return evaluate.call(this, "fetch('/started').then(() => new Promise(() => {}))", options);
       });
-      try {
-        const controller = new AbortController();
-        const pending = research.run("fetch", url, 5, controller.signal);
-        const cancelled = assert.rejects(pending, /cancelled recovery test/);
-        await ready;
-        controller.abort(new Error("cancelled recovery test"));
-        await cancelled;
-        const messages: string[] = [];
-        const recovered = await research.run("fetch", url, 5, undefined, undefined, message => messages.push(message));
-        assert.match(recovered.output, /recovered document/);
-        assert.ok(messages.some(message => /fresh (?:browser\/)?tab/.test(message)));
-        assert.ok(messages.every(message => !/Resuming/.test(message)));
-        assert.equal(launches, engine === "firefox" ? 2 : 1);
-      } finally { await research.close(); }
+      const controller = new AbortController();
+      const cancelled = assert.rejects(research.run("fetch", url, 5, controller.signal), /tab closed to terminate running JavaScript/);
+      await ready;
+      controller.abort(new Error("cancelled recovery test"));
+      await cancelled;
+      const messages: string[] = [];
+      const recovered = await research.run("fetch", url, 5, undefined, undefined, message => messages.push(message));
+      assert.match(recovered.output, /recovered document/);
+      assert.ok(messages.some(message => /fresh tab/.test(message)));
+      assert.ok(messages.every(message => !/Resuming/.test(message)));
+      assert.match(recovered.tab, /^127\.0\.0\.1:\d+$/);
     });
   }
 });

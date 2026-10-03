@@ -4,9 +4,11 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
+import { BrowserClient } from "../src/broker/client.ts";
 import { SnapshotStore } from "../src/snapshots.ts";
 import { BrowserProcessLauncher, publicBrowserError } from "../src/core/process.ts";
 import { createWebTools } from "../src/web/index.ts";
+import { isolateBrokers } from "./helpers.ts";
 
 const context = {} as ExtensionToolContext;
 
@@ -23,12 +25,15 @@ test("JSON preserves fitting long strings and treats undefined object fields as 
 });
 
 test("public host failure snapshots omit native paths and profile-owner diagnostics", async t => {
+  await isolateBrokers(t);
   const directory = await mkdtemp(path.join(tmpdir(), "pi-snapshot-host-failure-"));
   const store = new SnapshotStore({ directory: path.join(directory, "snapshots") });
   const profile = path.join(directory, "private-profile");
-  const owner = await BrowserProcessLauncher.create({ browser: "firefox", executable: "/bin/false", headless: true, profileDir: path.join(profile, "firefox") });
-  const web = createWebTools({ snapshots: store, settings: { backend: "browser", browser: "firefox", headless: true, executable: "/bin/false", profileDir: profile } });
-  t.after(async () => { await web.close(); await owner.close(); await rm(directory, { recursive: true, force: true }); });
+  // This live process holds the profile lease, so the broker must refuse it rather than take it over.
+  const owner = await BrowserProcessLauncher.create({ browser: "firefox", executable: "/bin/false", headless: true, profileDir: profile });
+  const client = new BrowserClient({ source: { browser: "firefox", profileDir: profile, headless: true }, session: "owned", idleMs: 300 });
+  const web = createWebTools({ snapshots: store, settings: { backend: "browser" }, browser: () => client });
+  t.after(async () => { await web.close(); await client.close(); await owner.close(); await rm(directory, { recursive: true, force: true }); });
   let id = "";
   await assert.rejects(web.tools[1].execute("owned", { url: "https://example.test/" }, undefined, undefined, context), (error: unknown) => {
     assert(error instanceof Error);

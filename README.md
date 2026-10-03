@@ -32,66 +32,93 @@ or environment variables are modified. Pagent has an equivalent Web backend
 dropdown with private per-workspace persistence.
 
 Precedence is runtime override → explicit SDK host setting → `PI_WEB_BACKEND`
-→ `auto`. Reset is not Auto: with `PI_WEB_BACKEND=browser`, Reset selects browser.
+→ `browser`. Reset is not a fixed policy: with `PI_WEB_BACKEND=auto`, Reset selects Auto.
 Each web invocation snapshots its policy before any asynchronous work. Switching
 affects subsequent calls; it does not reroute/cancel an active or queued request,
 close tabs, or discard cookies/challenge state. To switch a request waiting for a
 CAPTCHA, cancel that request, change the policy, then retry.
 
-### Browser engine default
+### Browser selection
 
-`/browser-default` chooses the engine independently of `/web-backend`:
+One browser serves `browser`, `web_search`, and `web_fetch`. Choose it with
+`/browser` (picker when omitted) or `PI_BROWSER`:
 
 ```text
-/browser-default             # Picker: configured default, Chromium, Firefox
-/browser-default firefox
-/browser-default chromium
-/browser-default reset       # Follow the configured engine, not always Chromium
-/browser-default status
+/browser                          # Picker: configured, Chromium, Firefox, default profile, remotes
+/browser chromium                 # Stable Pi profile <agentDir>/browser/profiles/chromium
+/browser firefox                  # Stable Pi profile <agentDir>/browser/profiles/firefox
+/browser firefox-default-profile  # This OS user's own Firefox default profile
+/browser remote void-flip         # A published remote browser (see below)
+/browser reset                    # Follow PI_BROWSER (default chromium)
+/browser status
 ```
 
-This is a session-branch override with the same reload/resume, fork, tree, and
-New behavior as `/web-backend`. The footer shows `browser:<engine>` with `*` for
-an override. It does not change global settings, the environment, or web backend
-policy. Non-UI invocation without arguments reports status instead of prompting.
+`PI_BROWSER` accepts `chromium`, `firefox`, `firefox-default-profile`, or
+`remote:<name>`. The command is a session-branch override with the same
+reload/resume, fork, tree, and New behavior as `/web-backend`; the footer shows
+`browser:<choice>` with `*` for an override. Switching affects later calls only;
+open tabs, cookies, and running calls are unchanged, and the previous browser
+keeps this session's connection until the session ends.
 
-Search/fetch snapshot the engine when invoked, even before Codex authentication
-or browser queuing. Codex results are unaffected; browser execution and fallback
-use that snapshot. Each engine lazily owns its own research process, cookies,
-queue, and pending pages. Switching does not launch or close a browser. Switching
-back reuses the original research state; retrying while a different engine is
-selected starts work there rather than resuming the other engine's pending page.
+Pi profiles are stable across sessions: history, cookies, and logins persist.
+`firefox-default-profile` resolves `~/.mozilla/firefox/profiles.ini`: the single
+`[Install…]` `Default=`, otherwise the single profile with `Default=1`; anything
+else is an ambiguity error. Firefox refuses to start on a profile that another
+Firefox already uses; close it first. **Pages logged in there are visible to the
+agent**, including through search/fetch, which run in the same browser.
 
-For `browser`, each destination owns one persistent tab per tool instance. Its
-first call uses the explicit `browser` argument or selected default. Later calls
-reuse its engine; a conflicting explicit engine is an error. Local process
-recovery keeps the engine; lost external attachments require explicit closure
-and reconnection. Use `/browser-close [remote]` before changing that destination's
-engine. Active and already-queued invocations are not rerouted by a default change.
+`FIREFOX_BINARY` and `CHROMIUM_BINARY` override executable discovery. There is
+no silent engine or headless fallback.
 
-The SDK web-tool set exposes `getBrowserState()` and
-`setBrowserOverride("firefox" | "chromium" | null)`. Its `browserDefault` option
-accepts a shared `createBrowserDefault({ browser? })` controller, exported from
-`pi-browser/web`, for hosts coordinating multiple consumers. State reports
-`configured`, `override`, `effective`, and `source`, just like backend state.
-Pagent's workspace engine and UI are unchanged by this Pi command.
+### Shared browser broker
 
-`PI_BROWSER_EXECUTABLE` (or the SDK `executable` option) is scoped to the
-configured engine, not applied to a different engine after switching. Other
-engines use their normal discovery, including `FIREFOX_BINARY` and
-`CHROMIUM_BINARY`. There is no silent engine or headless fallback.
+Every browser source (a profile or a published remote socket) has one **broker**:
+a small detached Node process that is the only holder of the browser's debugging
+connection. Firefox accepts just one WebDriver BiDi session, so this is what lets
+any number of Pi sessions, workers, and forks share one browser window. The first
+call starts the broker; it launches the profile's browser (or attaches to the
+remote) and holds the profile's exclusive lock. Later sessions connect to its
+private Unix socket in `$TMPDIR/pi-browser-<uid>/` (mode `0700`, owner-checked),
+keyed by the profile's real path or the remote socket path. The broker exits
+**60 seconds** after its last session disconnects: a launched browser is closed
+normally (cookies flushed); a remote keeps running with only Pi-opened tabs closed.
 
-Environment defaults below are read when a web-tool set is created. Restart the
+Launch settings are fixed by the session that started the broker; a session
+asking for a different headless mode gets an error rather than a second browser.
+If a socket refuses connections and its recorded broker has exited, or a
+profile lock's recorded broker and browser processes have exited, the next
+session takes over automatically; a live owner is an error, never killed.
+The broker log is `$TMPDIR/pi-browser-<uid>/<key>.log`.
+
+**Every tab has a name.** Automatic names are the host (with port) without a
+leading `www.`, plus `+` and the length of everything after `host/`:
+`https://www.google.com/search` → `google.com+6`, `https://google.com/` →
+`google.com`, `about:blank` → `about+5`. Duplicates get `-2`, `-3`. A name is
+fixed when the tab is first seen. Tabs opened by people or pages are discovered,
+named, listed, and usable, but **never closed automatically**.
+
+The broker keeps each connected session's **10 most recently used tabs**; the most
+recent is that session's default tab. At every request and disconnect it closes
+Pi-opened tabs that are in no connected session's list. There is no ownership:
+any session can list and use any tab. Using a tab another session used since your
+last use returns a warning. Each `browser`, `web_search`, or `web_fetch` call holds
+its tab exclusively from resolving it to its final capture, so calls on one tab,
+from any session, run one after another; a cancelled waiting call releases nothing,
+and a disconnecting session releases its tabs. Different tabs run in parallel. Interrupting running JavaScript closes that tab in either engine
+(Chromium stops the script first); if closure fails, a launched browser is stopped
+and restarted by the next call, or a remote connection is dropped, and every
+session is told its tabs are gone. A launched browser keeps its first blank tab
+as an unlisted window anchor, so closing a Pi tab never closes the window.
+
+Environment defaults below are read when a Pi session first uses the tools. Restart the
 host or use Pi `/reload` after changing its process environment.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `PI_WEB_BACKEND` | `auto` | `auto`, `codex`, or `browser` |
-| `PI_WEB_BROWSER` | `chromium` | `chromium` or `firefox` |
+| `PI_WEB_BACKEND` | `browser` | `auto`, `codex`, or `browser` |
+| `PI_BROWSER` | `chromium` | `chromium`, `firefox`, `firefox-default-profile`, or `remote:<name>` |
 | `PI_WEB_SEARCH_ENGINE` | `duckduckgo` | `duckduckgo`, `bing`, or `brave` |
 | `PI_BROWSER_HEADLESS` | `false` | Explicit `true`/`1` or `false`/`0` |
-| `PI_BROWSER_EXECUTABLE` | engine discovery | Browser executable override |
-| `PI_WEB_PROFILE_DIR` | host-specific | Dedicated research profile root; engine subdirectories are added |
 
 `auto` attempts Codex first for each call. Missing/expired credentials, unavailable
 or unsupported service/model, transport errors/timeouts, HTTP 429, and service
@@ -101,11 +128,14 @@ request errors do **not** trigger fallback. `codex` never falls back; `browser`
 never reads Codex credentials. There is no curl/HTTP-scraping fallback.
 
 ```sh
-# Default: Codex first, browser when unavailable.
+# Default: research in the browser selected for the `browser` tool.
 pi
 
+# Codex first, browser when unavailable.
+PI_WEB_BACKEND=auto pi
+
 # Always use a visible Firefox for research.
-PI_WEB_BACKEND=browser PI_WEB_BROWSER=firefox pi
+PI_BROWSER=firefox pi
 
 # Strict Codex-only: errors remain errors.
 PI_WEB_BACKEND=codex pi
@@ -127,27 +157,31 @@ viewport and hang screenshot capture; headless geometry is unchanged.
 ## Tool behavior
 
 - `web_search({query, max_results?})`: compact numbered titles, links, and excerpts,
-  plus a snapshot ID. Default **10**, maximum **20** results; preview capped at
+  plus a snapshot ID. Browser results open in an automatically named tab of the
+  shared browser and report its name, usable with `browser`. Default **10**, maximum **20** results; preview capped at
   **200 lines / 16 KiB**. Search adapters exclude known ads, unwrap known tracking
   links, deduplicate results, and distinguish confirmed empty searches from
   loading, challenges, and unsupported layouts. Excerpts are not fetched pages.
   Codex counts come from actual structured results; unknown formats remain raw
   with a warning and unknown count rather than pretending to enforce the limit.
-- `web_fetch({url})`: readable Markdown plus a snapshot ID, preview capped at
+- `web_fetch({url})`: readable Markdown plus a snapshot ID (and its tab name with
+  the browser backend), preview capped at
   **2000 lines / 50 KiB**. There is no format or mode argument. URLs must be
   HTTP(S) without embedded credentials. Cite the fetched URL.
-- `browser({remote?, browser?, url?, eval?})`: one persistent tab per destination, optional
-  navigation, pre-eval screenshot, awaited JavaScript expression, then final
-  capture. Returns a compact **8 KiB** receipt and small eval results/errors;
-  eval previews are capped at **4 KiB / 60 lines**, with larger captured results
-  in snapshot JSON. Omit `url` to preserve user changes; each destination keeps
-  its engine. Calls to the same destination are serialized; different destinations
-  are independent. Use async IIFEs for multiple statements in either engine.
-  `/browser-close [remote]` closes that destination's tab and connection (or owned
-  local process); omission uses `PI_BROWSER_REMOTE`, or local launch when unset.
-  Externally attached browsers stay alive.
-  Ordinary eval errors retain the tab; screenshot failures do not discard
-  completed eval/content. Inspect saved HTML first, screenshots for visual evidence.
+- `browser({tab?, url?, eval?, list?})`: use a named tab of the selected shared
+  browser: optional navigation, pre-eval screenshot, awaited JavaScript expression,
+  then final capture. Omitted `tab` uses this session's last tab; an unknown `tab`
+  with `url` opens a new tab with that name; an unknown `tab` without `url` is an
+  error. Without a usable last tab, `url` opens an automatically named tab and
+  says so when the previous one vanished; without `url` it is an error. Omit `url`
+  to preserve the page. `list: true` lists all tabs with title, URL, last-using
+  session and time, and marks this session's default. Returns a compact **8 KiB**
+  receipt with tab name and full URL plus small eval results/errors; eval previews
+  are capped at **4 KiB / 60 lines**, with larger captured results in snapshot
+  JSON. Use async IIFEs for multiple statements in either engine. Ordinary eval
+  errors retain the tab; screenshot failures do not discard completed eval/content.
+  Inspect saved HTML first, screenshots for visual evidence. Concurrent calls on the
+  same tab wait for each other; use separate tabs for parallel work.
 - `web_read({snapshot, format?, cursor?})`: read immutable saved evidence without
   network, credentials, or changes to a live page. Default format is `md`; other
   formats are `text`, `html`, `json`, `screenshot`, and `before-screenshot`.
@@ -157,15 +191,14 @@ viewport and hang screenshot capture; headless geometry is unchanged.
 
 ### Published remote browsers
 
-Only the manual `browser` tool supports remote attachment. Search/fetch and
-Pagent's workspace browser retain their independent local launch behavior.
-The publisher runs a dedicated desktop browser with debugging on
+Selecting a remote (`/browser remote <name>` or `PI_BROWSER=remote:<name>`)
+makes `browser`, `web_search`, and `web_fetch` share that browser through its
+broker. Pagent's workspace browser is unaffected. The publisher runs a dedicated desktop browser with debugging on
 **127.0.0.1:9222**, then SSHes **into the Pi host**, forwarding a private Unix
 socket to that debugging port. Pi never initiates SSH or launches a remote browser.
 This also works when Pi runs in a VM that cannot SSH outward.
 
-In Pi, request setup instructions (the helper always uses Firefox, independently
-of `/browser-default`):
+In Pi, request setup instructions (the helper always publishes Firefox):
 
 ```text
 /browser-remote-setup
@@ -207,51 +240,46 @@ and starts Firefox on Darwin/Linux as the desktop user, inheriting the
 display/Wayland environment. A busy profile without an available debugging port
 is an error; it never removes profile locks or restarts a browser. It never uses
 the default browser profile, sudo, headless mode, or disabled sandboxing. A failed
-startup reports the profile's `browser.log`. Chromium remote attachment remains
-supported by the core/tool, but this helper launches only Firefox.
+startup reports the profile's `browser.log`. A Chromium published the same way
+(debugging on 127.0.0.1:9222, socket forwarded into the same directory) also
+works: the broker detects Chromium by its `/json/version` browser WebSocket URL and
+otherwise uses Firefox WebDriver BiDi. This helper launches only Firefox.
 
 The helper then runs the inbound SSH tunnel in the foreground. Ctrl+C closes the
 tunnel, **not the browser**; the publisher owns that browser. No automatic socket
 unlink or browser shutdown is performed.
 
-Attach by name:
+Select it by name:
 
-```json
-{"remote":"void-flip","browser":"firefox","url":"https://example.com"}
+```text
+/browser remote void-flip
 ```
 
-Or configure the default manual destination when starting Pi:
+Or start Pi with it as the configured browser:
 
 ```sh
-PI_BROWSER_REMOTE=void-flip PI_WEB_BROWSER=firefox pi
+PI_BROWSER=remote:void-flip pi
 ```
 
-`remote` overrides `PI_BROWSER_REMOTE`, which is read when the tool factory is
-created. Without either, launch remains local. Engine selection still follows
-`browser`, `/browser-default`, and `PI_WEB_BROWSER` when opening a destination.
-Repeated calls to that destination reuse exactly the same tab and pinned engine;
-explicit engine conflicts require `/browser-close [remote]` first. Specifying
-another remote selects its independent tab; omitting `remote` always selects the
-configured default destination, not the last remote used.
 Remote names contain 1–64 letters, digits, dots, underscores or hyphens, starting with a
 letter or digit. Only actual `.sock` Unix sockets are accepted, never symlinks.
-Model receipts refer to names, not socket paths. There are no `ssh`/`endpoint`
-tool arguments or `PI_BROWSER_SSH`/`PI_BROWSER_ENDPOINT` settings.
+Model receipts refer to names, not socket paths. The tools have no browser,
+remote, `ssh`, or `endpoint` arguments; the user selects the browser.
 
 A failed connection gives actionable instructions and, with TUI/RPC, asks for
 **one** retry after restoring the publisher tunnel/browser. Decline, no UI, or a
 failed final attempt returns an error. Abort never retries. Navigation and eval
 are never repeated by this retry, and there is no automatic local fallback.
+Search/fetch report the connection error without the retry prompt.
 
-Each remote has one connection and one tool-owned tab within a tool instance,
-including Firefox's **single BiDi session**. Other automation clients must wait
-for its owner to release that session. Pi creates its own tabs, never
-adopts human tabs (including blank tabs), and closes only its tabs and connection.
-`/browser-close`, `/reload`, and shutdown never stop the publisher's browser or
-SSH tunnel. A lost connection/tab requires explicit close and reconnect. Abrupt
-Firefox disconnects may require owner recovery of its busy automation session.
-Interrupted eval closes only its owned tab; if closure cannot be confirmed, Pi
-disconnects and warns that **JavaScript may continue running**.
+The remote's broker holds its single debugging connection (Firefox's **single
+BiDi session**) for all Pi sessions; other automation clients must wait until the
+broker exits. Tabs the publisher's user opened are listed and usable but never
+closed automatically; Pi-opened tabs follow the recent-tab rule and are closed
+when the broker exits. Neither the broker nor Pi stops the publisher's browser or
+SSH tunnel. A lost connection is reported to every session; the next call
+reconnects. Interrupted eval closes only its tab; if closure cannot be confirmed,
+the broker disconnects and warns that **JavaScript may continue running**.
 
 SSH can leave a stale socket after disconnecting. Confirm its previous tunnel
 has stopped, then manually remove **only that socket on the Pi host** before
@@ -299,12 +327,11 @@ never base64 text dumps. Model-facing receipts expose IDs, not host paths;
 `SnapshotStore.info(id).paths` is for trusted host use only.
 
 Pi shares `browser/<pi-session-id>/snapshots/` under its agent directory between
-manual browser and search/fetch producers. Reload/resume retain evidence; normal
-forks copy it within bounds, preserving IDs/cursors but not profiles. New sessions
-start empty. Locally launched manual profiles use adjacent `manual/<engine>/`;
-research profiles use `research/`. These profiles preserve cookies on normal close and
-are separate from the user's ordinary browser profile. External attachment uses
-the profile chosen by the desktop browser's owner, not Pi's `manual/` directory.
+the browser tool and search/fetch. Reload/resume retain evidence; normal forks copy
+it within bounds, preserving IDs/cursors. New sessions start empty. Browser
+profiles are not per session: Pi's stable profiles live in
+`<agentDir>/browser/profiles/{chromium,firefox}` and preserve cookies on normal
+close; `firefox-default-profile` and remotes use their own profiles.
 
 Pagent uses private `<directory>/.pagent/web-snapshots/<sha256(agentId)>/`
 stores, retained across restart and same-ID agent recreation. These stores are
@@ -312,12 +339,10 @@ never HTTP-served, and Pagent exposes no host filesystem tools. Its starter UI
 renders native tool images. Installed CLI updates do not replace the directory's
 editable HTML or UI modules.
 
-Web retrieval owns a **separate research process per used engine**, never the
-Pagent workspace browser or the manual browser-tool process. Each engine retains
-up to three completed pages and at most eight total research tabs. Unfinished intervention pages are
-never automatically evicted. Independent Pi sessions have independent profiles.
-Explicit profile overrides are exclusive: concurrent owners get a clear error.
-Anonymous SDK clients without a supplied profile path receive unique paths.
+Browser research runs in the selected shared browser, never Pagent's workspace
+browser. Each search/fetch opens an automatically named tab; tabs waiting for
+human intervention stay in the session's recent list and are resumed by retrying
+the same operation, unless ten newer tabs pushed them out and closed them.
 
 ## Human intervention and cancellation
 
@@ -328,17 +353,17 @@ reloading or repeating navigation**. Each wait has a fresh continuation ID.
 
 Pi uses its confirmation UI, including RPC-capable hosts. Pagent provides native
 Continue/Cancel controls in its own UI. Hosts without an attention callback get
-an actionable error with URL/tab ID; retrying the identical operation resumes
+an actionable error with URL and tab name; retrying the identical operation resumes
 that page. Challenges are never solved automatically. Detection is heuristic,
 not a promise that every access check can be recognized or completed.
 
 Cancelling while waiting for a human leaves the page intact while its host stays
 alive. Cancelling or timing out **running JavaScript** closes the affected
-Chromium research tab; Firefox must stop its research process. A later call
-reports the loss and opens a fresh tab/process. It does not silently rerun the
-failed operation. Pagent's UI process and unsaved workspace DOM are unaffected.
-Closing/reloading the Pi extension or shutting down Pagent closes its owned
-research browsers; cookies survive normal shutdown but unsaved pages do not.
+research tab in either engine. A later call reports the loss and opens a fresh
+tab. It does not silently rerun the failed operation. Pagent's UI process and
+unsaved workspace DOM are unaffected. Closing/reloading the Pi extension
+disconnects its broker connections; brokers close their browsers when idle.
+Cookies survive normal shutdown but unsaved pages do not.
 
 Extraction includes only accessible content, not closed shadow roots,
 cross-origin embedded documents, PDF viewer text, or canvas pixels. It has
@@ -350,11 +375,16 @@ or Pagent `aos` bridge are installed in research pages.
 ## Library boundary
 
 ```ts
-import { launchBrowser } from 'pi-browser';
-import { createWebTools, SnapshotStore } from 'pi-browser/web';
+import { BrowserClient, createWebTools, SnapshotStore } from 'pi-browser/web';
 
+// One broker per profile; any number of clients (sessions) share its tabs.
+const browser = new BrowserClient({
+  source: { browser: 'firefox', profileDir: '/private/application-state/research', headless: false },
+  session: 'agent-1',
+  idleMs: 0, // close the browser as soon as the last client disconnects
+});
 const web = createWebTools({
-  profileDir: '/private/application-state/research',
+  browser: () => browser,
   snapshots: new SnapshotStore({ directory: '/private/application-state/snapshots' }),
   onAttention: async (request, signal) => hostConfirm(request, signal),
   onProgress: message => hostLog(message),
@@ -363,19 +393,26 @@ const web = createWebTools({
 web.setBackendOverride('browser');
 web.getBackendState(); // { configured, override, effective, source }
 web.setBackendOverride(null); // Reset to the original configuration.
-// Call web.close() on host shutdown; switching policy never requires close().
+// On host shutdown: await web.close(); await browser.close();
 ```
 
+`BrowserClient` starts the source's broker on first use (`source` is
+`{ browser, profileDir, headless? }` or `{ remote, socketPath }`) and offers
+`open({ tab?, url?, create? })`, `list()`, and `close()`. Opened `SharedTab`s
+have `name`, `closed`, `navigate`, `evaluate`, `screenshot`, and `focus`. The host
+owns and closes clients; `createWebTools` resolves its `browser` function per
+call and never closes it. Without `browser`, browser-backed research is an error.
+
 The root entry point contains no Pi imports. It exports typed browser sessions,
-tabs, `launchBrowser(options)`, `connectBrowser({ browser, socketPath, signal? })`,
-the reusable `BrowserProcessLauncher`, and `findBrowserExecutable(kind)`.
-`connectBrowser` attaches through a Unix socket forwarding to the publisher's
-127.0.0.1:9222 and returns the same `BrowserSession` API: `openTab()` creates owned
-tabs; `close()` releases them and the connection without stopping the external
-browser. Chromium discovers `/json/version` over that socket; both engines keep
-the logical Host `127.0.0.1:9222` for WebSocket handshakes. It provides no SSH or
-setup UI. Low-level CDP/BiDi clients retain endpoint support for owned launches
-and optionally dial a supplied `socketPath`.
+tabs, `launchBrowser(options)`, `connectBrowser({ socketPath, signal? })`, the
+reusable `BrowserProcessLauncher`, and `findBrowserExecutable(kind)`. Sessions
+create owned tabs (`openTab()`), list top-level pages (`pages()`), and attach to
+existing ones (`tab(id)`), which `close()` leaves open. `connectBrowser` attaches
+through a Unix socket forwarding to the publisher's 127.0.0.1:9222 and detects the
+engine; `close()` releases owned tabs and the connection without stopping the
+external browser. Both engines keep the logical Host `127.0.0.1:9222` for
+WebSocket handshakes. Low-level CDP/BiDi clients retain endpoint support for owned
+launches and optionally dial a supplied `socketPath`.
 Executable discovery is shared with startup; Pagent uses it to prefer installed
 Firefox without duplicating platform-specific paths. `pi-browser/cdp` and
 `pi-browser/bidi` expose low-level transports for application adapters. The
@@ -384,14 +421,11 @@ Firefox without duplicating platform-specific paths. `pi-browser/cdp` and
 search, fetch, and read definitions sharing its `snapshots` store. Supply a private
 store directory for durable SDK evidence; the default is a unique temporary path.
 
-The extension's internal `createBrowserTool()` factory in `src/browser-tool.ts`
-is **not exported by `pi-browser/web`**. Its `remote?` option replaces the
-environment default. Its `closeBrowser(remote?)` method closes that destination,
-resolving an omitted remote exactly like the tool. Alongside profile/artifact paths, snapshots, and launch
-options, it accepts `onSetup(instructions, signal): Promise<boolean>`; return
-true to authorize the single connection retry. Pi wires this to its confirmation
-UI without a wait timeout. Without a callback, failures return instructions
-immediately. These options do not belong to `createWebTools()`.
+The extension's internal `createBrowserTool({ browser, snapshots?, onSetup? })`
+factory in `src/browser-tool.ts` is **not exported by `pi-browser/web`**.
+`onSetup(instructions, signal): Promise<boolean>` returns true to authorize the
+single remote connection retry; Pi wires it to its confirmation UI. Without a
+callback, failures return instructions immediately.
 
 Pagent retains its own workspace-origin restrictions, `aos` binding, event
 protocol, checkpointing, and recovery policy. It never loads the extension entry
@@ -413,15 +447,17 @@ node --test test/web-extract-review.test.ts
 node --test --test-concurrency=1 test/browser-tool.test.ts test/extension.test.ts
 node --test test/browser-remote.test.ts
 node --test --test-concurrency=1 test/backend-command.test.ts test/web-backend.test.ts
-node --test --test-concurrency=1 test/browser-default-command.test.ts test/browser-default.test.ts
+node --test --test-concurrency=1 test/browser-command.test.ts test/browser-selection.test.ts test/broker.test.ts
 
 # Optional: visible, sandboxed Firefox/Chromium windows on the live host display.
 # Local HTTP fixtures only; no model or public-network requests.
 PI_BROWSER_LIVE_DISPLAY=1 node --test test/headed-browser.test.ts
 ```
 
-The focused remote test uses one disposable headless Firefox and a local Unix
-forward (no SSH or model requests). It requires port 9222 to be free and refuses
+Tests isolate brokers by setting `TMPDIR` to disposable directories and use
+disposable profiles, never real ones. The whole suite also runs in parallel with
+`node --test test/*.test.ts`. The focused remote test uses disposable headless
+Firefox and Chromium publishers and a local Unix forward (no SSH or model requests). It requires port 9222 to be free and refuses
 an occupied port rather than touching an existing browser.
 
 The distributable contains compiled JavaScript and declarations in `dist/`;
@@ -459,10 +495,11 @@ recovery: confirm the recorded owner has stopped, then remove only that store's
 `.operation-lock` directory. Never infer owner death from a failed call or lock
 age. There is no automatic stale-lock deletion; model tools cannot recover it.
 
-A locally launched profile's `.pi-browser-owner/owner.json` records the owner
-and browser PIDs.
-Never remove its lock or terminate a browser solely because a previous command
-failed. Confirm both recorded processes have stopped first. Then remove only
-that profile's `.pi-browser-owner` directory and retry. Debugging sockets bind
-to loopback; keep them and profiles private. This is local trusted-user
-software, not a multi-tenant security boundary.
+A locally launched profile's `.pi-browser-owner/owner.json` records the broker
+and browser PIDs. The next broker removes it automatically only when both recorded
+processes have exited; otherwise it reports the profile as in use and never
+terminates the owner. Likewise a broker socket whose recorded broker has exited is
+replaced automatically. To stop a broker deliberately, end its sessions (it exits
+60 seconds later) or send it SIGTERM; it closes its browser normally. Debugging
+sockets bind to loopback; keep them, broker sockets, and profiles private. This is
+local trusted-user software, not a multi-tenant security boundary.

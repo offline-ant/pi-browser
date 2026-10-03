@@ -1,11 +1,12 @@
 import path from "node:path";
 import { getAgentDir, SessionManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { BrowserClient } from "./broker/client.ts";
 import { createBrowserTool } from "./browser-tool.ts";
 import { registerBrowserRemoteSetup } from "./browser-remote.ts";
 import { registerWebBackendCommand } from "./backend-command.ts";
-import { createBrowserDefault, type BrowserDefault } from "./browser-default.ts";
-import { registerBrowserDefaultCommand } from "./browser-default-command.ts";
-import { createWebTools, resolveWebSettings, SnapshotStore, WebAttentionRequired } from "./web/index.ts";
+import { browserHeadless, browserSource, createBrowserSelection, type BrowserChoice, type BrowserSelection } from "./browser-selection.ts";
+import { registerBrowserCommand } from "./browser-command.ts";
+import { createWebTools, SnapshotStore, WebAttentionRequired } from "./web/index.ts";
 import { copySnapshotTree } from "./snapshot-copy.ts";
 
 function sessionRoot(session: string): string {
@@ -19,10 +20,11 @@ export default function browserExtension(pi: ExtensionAPI): void {
   // registered: session-owned implementations supply execution below. Keep the
   // schemas in the tool factories rather than duplicating them in the adapter.
   const webTemplate = createWebTools();
-  const browserTemplate = createBrowserTool({ profileDir: "", artifactDir: "" });
+  const browserTemplate = createBrowserTool({ browser: () => { throw new Error("pi-browser has no session yet."); } });
   let closing: Promise<void> | undefined;
   let ready: Promise<void> = Promise.resolve();
-  let host: { web: ReturnType<typeof createWebTools>; browser: ReturnType<typeof createBrowserTool>; defaults: BrowserDefault } | undefined;
+  let host: { web: ReturnType<typeof createWebTools>; browser: ReturnType<typeof createBrowserTool>; selection: BrowserSelection;
+    clients: Map<BrowserChoice, Promise<BrowserClient>> } | undefined;
 
   function runtime(ctx: ExtensionContext) {
     if (closing) throw new Error("pi-browser extension is shut down.");
@@ -30,24 +32,33 @@ export default function browserExtension(pi: ExtensionAPI): void {
     const session = ctx.sessionManager.getSessionId();
     const root = sessionRoot(session);
     const snapshots = new SnapshotStore({ directory: path.join(root, "snapshots") });
-    const settings = resolveWebSettings({}, process.env, path.join(root, "research"));
-    const defaults = createBrowserDefault();
+    const selection = createBrowserSelection();
+    const headless = browserHeadless();
+    const profiles = path.join(getAgentDir(), "browser", "profiles");
+    const clients = new Map<BrowserChoice, Promise<BrowserClient>>();
+    // One broker connection per selected browser, shared by browser and web tools so they share this session's tabs.
+    const browser = () => {
+      const choice = selection.getState().effective;
+      let client = clients.get(choice);
+      if (!client) {
+        const created = browserSource(choice, profiles, headless).then(source => new BrowserClient({ source, session }));
+        void created.catch(() => { if (clients.get(choice) === created) clients.delete(choice); });
+        clients.set(choice, created);
+        client = created;
+      }
+      return client;
+    };
     host = {
-      defaults,
+      selection, clients,
       web: createWebTools({
-        snapshots,
-        browserDefault: defaults,
-        profileDir: path.join(root, "research"),
+        snapshots, browser,
         onAttention: async (request, signal) => {
-          if (!ctx.hasUI) throw new WebAttentionRequired(request.reason, request.tabId, request.url, settings.headless);
-          return ctx.ui.confirm("Web browser needs attention", `${request.reason}\n\n${request.url}\nTab: ${request.tabId}\n\nResolve it in the research browser, then confirm to continue without reloading.`, { signal });
+          if (!ctx.hasUI) throw new WebAttentionRequired(request.reason, request.tab, request.url, headless);
+          return ctx.ui.confirm("Web browser needs attention", `${request.reason}\n\n${request.url}\nTab: ${request.tab}\n\nResolve it in the shared browser, then confirm to continue without reloading.`, { signal });
         },
       }),
       browser: createBrowserTool({
-        snapshots,
-        browserDefault: defaults,
-        profileDir: path.join(root, "manual"), artifactDir: snapshots.directory,
-        browser: settings.browser, headless: settings.headless, executable: settings.executable,
+        snapshots, browser,
         onSetup: ctx.hasUI ? (instructions, signal) => ctx.ui.confirm("Browser connection needs setup", `${instructions}\n\nAfter restoring the publisher tunnel/browser, confirm to retry once. Decline to return the connection error.`, { signal }) : undefined,
       }),
     };
@@ -72,16 +83,8 @@ export default function browserExtension(pi: ExtensionAPI): void {
     },
   });
   registerWebBackendCommand(pi, ctx => runtime(ctx).web);
-  registerBrowserDefaultCommand(pi, ctx => runtime(ctx).defaults);
+  registerBrowserCommand(pi, ctx => runtime(ctx).selection);
   registerBrowserRemoteSetup(pi);
-  pi.registerCommand("browser-close", {
-    description: "Close the browser-tool destination: [remote], defaulting to PI_BROWSER_REMOTE or local launch. External browsers remain open. Profiles and evidence are retained.",
-    async handler(args, ctx) {
-      if (!host) { ctx.ui.notify("No browsers are open.", "info"); return; }
-      await host.browser.closeBrowser(args.trim() || undefined);
-      ctx.ui.notify("Browser closed.", "info");
-    },
-  });
   pi.on("session_start", async (event, ctx) => {
     if (event.reason !== "fork") return;
     // Keep failures on the execution gate too: Pi reports lifecycle errors but
@@ -96,7 +99,9 @@ export default function browserExtension(pi: ExtensionAPI): void {
   });
   pi.on("session_shutdown", () => {
     closing ??= (async () => {
-      const results = await Promise.allSettled([webTemplate.close(), browserTemplate.close(), host?.web.close(), host?.browser.close()]);
+      const results = await Promise.allSettled([webTemplate.close(), host?.web.close()]);
+      // Disconnecting lets each broker close this session's unused tabs and exit when idle.
+      results.push(...await Promise.allSettled([...host?.clients.values() ?? []].map(async client => (await client).close())));
       const errors = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
       if (errors.length) throw new AggregateError(errors, "pi-browser shutdown failed");
     })();

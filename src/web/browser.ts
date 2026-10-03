@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
-import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { launchBrowser, type BrowserSession, type BrowserTab } from "../core/index.ts";
+import { TabClosed, type BrowserClient, type SharedTab } from "../broker/client.ts";
 import { capturePage } from "../capture.ts";
 import { publicBrowserError } from "../core/process.ts";
 import { SnapshotStore, snapshotSummary, type SnapshotInfo, type SnapshotInput } from "../snapshots.ts";
@@ -9,14 +8,11 @@ import { abortable, validateWebUrl } from "./async.ts";
 import { inspectionExpression, type PageInspection, type SearchResult } from "./extract.ts";
 import type { AttentionHandler, WebSettings } from "./settings.ts";
 
-const MAX_TABS = 8;
-const RECENT_TABS = 3;
-
 export interface BrowserWebResult {
   output: string;
   url: string;
   title: string;
-  tabId: string;
+  tab: string;
   results?: SearchResult[];
   limitations: string[];
   snapshot?: SnapshotInfo;
@@ -34,32 +30,31 @@ export function formatSearchResults(results: SearchResult[], compact = false): s
 }
 
 export class WebAttentionRequired extends Error {
-  readonly tabId: string;
+  readonly tab: string;
   readonly url: string;
-  constructor(reason: string, tabId: string, url: string, headless = false) {
-    super(`${reason} Research tab ${tabId}: ${url}. ${headless
+  constructor(reason: string, tab: string, url: string, headless = false) {
+    super(`${reason} Research tab ${tab}: ${url}. ${headless
       ? "This browser is headless; no visible window is available for manual correction. Use a headed host to intervene, or a host-provided programmatic intervention handler."
       : "Leave this tab open and retry the same web operation after resolving it; retry resumes without navigating."}`);
-    this.tabId = tabId;
+    this.tab = tab;
     this.url = url;
   }
 }
 
-/** A separate owned research process. No application/native bridge is installed in its pages. */
+/** Research in auto-named tabs of the shared browser. No application/native bridge is installed in its pages. */
 export class BrowserResearch {
   private readonly settings: WebSettings;
-  private readonly launch: typeof launchBrowser;
+  private readonly client: BrowserClient;
   readonly snapshots: SnapshotStore;
   private readonly stopped = new AbortController();
-  private browser?: Promise<BrowserSession>;
   private queue: Promise<unknown> = Promise.resolve();
-  private pending = new Map<string, BrowserTab>();
-  private recent: BrowserTab[] = [];
+  /** IDs of tabs awaiting human help, resumed by retrying the same operation. */
+  private pending = new Map<string, string>();
   private closing?: Promise<void>;
 
-  constructor(settings: WebSettings, launch: typeof launchBrowser = launchBrowser, snapshots = new SnapshotStore()) {
+  constructor(settings: WebSettings, client: BrowserClient, snapshots = new SnapshotStore()) {
     this.settings = settings;
-    this.launch = launch;
+    this.client = client;
     this.snapshots = snapshots;
   }
 
@@ -73,40 +68,25 @@ export class BrowserResearch {
     return pending;
   }
 
-  /** Recovery is performed only on a new call, never by silently repeating failed work. */
-  private async reconcile(signal: AbortSignal, progress?: (message: string) => void): Promise<void> {
-    if (this.browser) {
-      const browser = await abortable(this.browser, signal);
-      if (browser.closed) {
-        // Finish the old process/profile cleanup before attempting another launch.
-        await browser.close();
-        this.browser = undefined;
-        this.pending.clear();
-        this.recent = [];
-        progress?.("The previous research browser closed. This new call will open a fresh browser/tab; unsaved research pages cannot be resumed.");
-        return;
-      }
-    }
-    let lostPending = false;
-    for (const [key, tab] of this.pending) {
-      if (tab.closed) { this.pending.delete(key); lostPending = true; }
-    }
-    this.recent = this.recent.filter(tab => !tab.closed);
-    if (lostPending) progress?.("A previous research tab closed. Its operation cannot resume intact; this new call will open a fresh tab if needed. Other research tabs are retained.");
-  }
-
-  private async reserveTab(): Promise<void> {
-    while (this.pending.size + this.recent.length >= MAX_TABS && this.recent.length) await this.recent.shift()!.close();
-    if (this.pending.size >= MAX_TABS) {
-      throw new Error(`All ${MAX_TABS} research tabs have unfinished operations. Resolve/retry an existing operation or close one of its browser tabs before starting another; pending intervention pages will not be discarded.`);
+  /** Hold the tab left for this operation, if it is still open. Recovery happens only on a new call, never by silently repeating failed work. */
+  private async resume(key: string, signal: AbortSignal, progress?: (message: string) => void): Promise<SharedTab | undefined> {
+    const id = this.pending.get(key);
+    if (id === undefined) return undefined;
+    try { return (await this.client.open({ id }, signal)).tab; }
+    catch (error) {
+      if (!(error instanceof TabClosed)) throw error;
+      this.pending.delete(key);
+      progress?.("A previous research tab closed. Its operation cannot resume intact; this new call opens a fresh tab.");
+      return undefined;
     }
   }
 
   private async execute(kind: "search" | "fetch", value: string, maxResults: number, signal: AbortSignal, attention: AttentionHandler | undefined, progress: ((message: string) => void) | undefined, previousCall: Promise<unknown>): Promise<BrowserWebResult> {
-    let tab: BrowserTab | undefined;
+    let tab: SharedTab | undefined;
+    const headless = this.client.headless;
     let inspectedPage: PageInspection | undefined;
     let captureAttempted = false;
-    const evidence: SnapshotInput = { kind, metadata: { backend: "browser", browser: this.settings.browser, ...(kind === "search" ? { query: value, searchEngine: this.settings.searchEngine, requestedCount: maxResults } : { url: value }) }, warnings: [] };
+    const evidence: SnapshotInput = { kind, metadata: { backend: "browser", ...(kind === "search" ? { query: value, searchEngine: this.settings.searchEngine, requestedCount: maxResults } : { url: value }) }, warnings: [] };
     const captureEvidence = async (): Promise<PageInspection> => {
       if (!tab || tab.closed) throw new Error("Research tab is unavailable for final capture.");
       captureAttempted = true;
@@ -124,6 +104,8 @@ export class BrowserResearch {
       delete evidence.metadata.screenshotCapturedAt;
       if (!signal.aborted) {
         try {
+          // Other sessions share this browser; Chromium does not render a background tab for screenshots.
+          await tab.focus();
           evidence.screenshot = await tab.screenshot();
           if (!evidence.screenshot) evidence.warnings.push("Screenshot unavailable: browser returned an empty image.");
           else evidence.metadata.screenshotCapturedAt = new Date().toISOString();
@@ -134,54 +116,38 @@ export class BrowserResearch {
     try {
       await abortable(previousCall, signal);
       signal.throwIfAborted();
-      await this.reconcile(signal, progress);
-      signal.throwIfAborted();
       const key = `${kind}:${value}`;
-      tab = this.pending.get(key);
+      tab = await this.resume(key, signal, progress);
       let navigationError: unknown;
       if (!tab) {
         const address = kind === "fetch" ? value : this.searchUrl(value);
         progress?.(`Browser ${kind}: ${address}`);
+        const opened = await this.client.open({ create: true, url: address }, signal);
+        tab = opened.tab;
+        evidence.metadata.browser = opened.browser;
+        if (!headless) await tab.focus();
         signal.throwIfAborted();
-        await this.reserveTab();
-        signal.throwIfAborted();
-        if (!this.browser) {
-          const starting = this.launch({ browser: this.settings.browser, profileDir: path.join(this.settings.profileDir, this.settings.browser), headless: this.settings.headless, executable: this.settings.executable });
-          this.browser = starting;
-          void starting.catch(() => { if (this.browser === starting) this.browser = undefined; });
-        }
-        const browser = await abortable(this.browser, signal);
-        signal.throwIfAborted();
-        tab = await browser.openTab();
-        try {
-          if (!this.settings.headless) await tab.focus();
-          signal.throwIfAborted();
-        } catch (error) {
-          // No navigation has started: do not advertise an empty tab as resumable.
-          await tab.close();
-          throw error;
-        }
-        this.pending.set(key, tab);
+        this.pending.set(key, tab.id);
         try { await tab.navigate(address, { signal, timeoutMs: 20_000 }); }
         catch (error) { signal.throwIfAborted(); navigationError = error; }
       } else {
-        progress?.(`Resuming research tab ${tab.id} without navigation.`);
-        if (!this.settings.headless) await tab.focus();
+        progress?.(`Resuming research tab ${tab.name} without navigation.`);
+        if (!headless) await tab.focus();
       }
-      evidence.metadata.tabId = tab.id;
+      evidence.metadata.tab = tab.name;
       const activeTab = tab;
       let deadline = Date.now() + 12_000;
       let earliest = Date.now() + 800;
       let stableSince = Date.now();
       let previous = "";
       const waitForUser = async (reason: string, url: string) => {
-        if (!this.settings.headless) await activeTab.focus();
-        const request = { id: randomUUID(), reason: this.settings.headless ? `${reason} The research browser is headless: no visible window is available; only a host-provided programmatic intervention can correct this live page.` : reason, url, tabId: activeTab.id };
+        if (!headless) await activeTab.focus();
+        const request = { id: randomUUID(), reason: headless ? `${reason} The research browser is headless: no visible window is available; only a host-provided programmatic intervention can correct this live page.` : reason, url, tab: activeTab.name };
         progress?.(`Needs attention: ${request.reason} (${url})`);
-        if (!attention) throw new WebAttentionRequired(reason, activeTab.id, url, this.settings.headless);
+        if (!attention) throw new WebAttentionRequired(reason, activeTab.name, url, headless);
         const continued = await abortable(Promise.resolve().then(() => attention(request, signal)), signal);
         signal.throwIfAborted();
-        if (!continued) throw new WebAttentionRequired("Web operation cancelled; the page was left intact.", activeTab.id, url, this.settings.headless);
+        if (!continued) throw new WebAttentionRequired("Web operation cancelled; the page was left intact.", activeTab.name, url, headless);
         // Never replay navigation over a human's sign-in, challenge solution, or correction.
         deadline = Date.now() + 12_000;
         earliest = Date.now() + 800;
@@ -203,7 +169,7 @@ export class BrowserResearch {
           await waitForUser(snapshot.attention, snapshot.url);
           continue;
         }
-        if (snapshot.unsupported) throw new Error(`${snapshot.unsupported} Research tab ${tab.id}: ${snapshot.url}`);
+        if (snapshot.unsupported) throw new Error(`${snapshot.unsupported} Research tab ${tab.name}: ${snapshot.url}`);
         const signature = kind === "search" ? JSON.stringify(snapshot.results) : snapshot.markdown;
         if (signature !== previous) { previous = signature; stableSince = Date.now(); }
         const complete = snapshot.ready && (kind === "search" ? snapshot.results.length > 0 || snapshot.noResults : snapshot.markdown.length > 0);
@@ -214,7 +180,7 @@ export class BrowserResearch {
             await waitForUser(final.attention, final.url);
             continue;
           }
-          if (final.unsupported) throw new Error(`${final.unsupported} Research tab ${tab.id}: ${final.url}`);
+          if (final.unsupported) throw new Error(`${final.unsupported} Research tab ${tab.name}: ${final.url}`);
           if (!final.ready || !(kind === "search" ? final.results.length > 0 || final.noResults : final.markdown.length > 0)) {
             captureAttempted = false;
             previous = "";
@@ -235,10 +201,8 @@ export class BrowserResearch {
           const saved = await this.snapshots.save(evidence);
           signal.throwIfAborted();
           this.pending.delete(key);
-          this.recent.push(tab);
-          while (this.recent.length > RECENT_TABS) await this.recent.shift()!.close();
           return {
-            url: finalUrl, title: final.title, tabId: tab.id, limitations: saved.warnings, snapshot: saved,
+            url: finalUrl, title: final.title, tab: tab.name, limitations: saved.warnings, snapshot: saved,
             ...(kind === "search" ? { results, sourceCount: final.results.length } : {}),
             output: kind === "search" ? formatSearchResults(results, true) : evidence.md!,
           };
@@ -271,7 +235,7 @@ export class BrowserResearch {
       const saved = await this.snapshots.save(evidence);
       failure.message += `\n${snapshotSummary(saved)}`;
       throw Object.assign(failure, { snapshot: saved });
-    }
+    } finally { await tab?.release(); }
   }
 
   private searchUrl(query: string): string {
@@ -296,8 +260,6 @@ export class BrowserResearch {
     this.closing = (async () => {
       await this.queue;
       this.pending.clear();
-      this.recent = [];
-      await (await this.browser?.catch(() => undefined))?.close();
     })();
     return this.closing;
   }

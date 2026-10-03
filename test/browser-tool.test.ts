@@ -1,162 +1,182 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
-import { createServer, type ServerResponse } from "node:http";
-import { tmpdir } from "node:os";
+import { readFile, stat } from "node:fs/promises";
+import type { ServerResponse } from "node:http";
 import path from "node:path";
-import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { Check } from "typebox/value";
-import { createBrowserTool } from "../src/browser-tool.ts";
-import { BrowserProcessLauncher } from "../src/core/index.ts";
+import { BrowserClient } from "../src/broker/client.ts";
+import { createBrowserTool, type BrowserListDetails, type BrowserResultDetails } from "../src/browser-tool.ts";
+import { SnapshotStore } from "../src/snapshots.ts";
+import { brokerPids, fixtureServer, isolateBrokers } from "./helpers.ts";
 
 const context = {} as ExtensionToolContext;
 type Params = Parameters<ReturnType<typeof createBrowserTool>["tool"]["execute"]>[1];
 
-function deferred() {
-  let resolve!: () => void;
-  const promise = new Promise<void>(done => { resolve = done; });
-  return { promise, resolve };
+function text(result: { content: { type: string; text?: string }[] }): string {
+  return result.content.map(part => part.text ?? "").join("");
 }
 
-for (const browser of ["chromium", "firefox"] as const) {
-  test(`${browser}: browser tool artifacts, ordering, cancellation and recovery`, { timeout: 90_000 }, async t => {
-    const root = await mkdtemp(path.join(tmpdir(), "pi-browser-tool-"));
-    let entered = deferred();
+for (const engine of ["chromium", "firefox"] as const) {
+  test(`${engine}: browser tool uses named shared tabs and saves evidence`, { timeout: 90_000 }, async t => {
+    const root = await isolateBrokers(t);
+    let entered!: () => void;
     let gate: ServerResponse | undefined;
-    const navigations: string[] = [];
-    const server = createServer((request, response) => {
-      if (request.url === "/gate") { gate = response; entered.resolve(); return; }
-      navigations.push(request.url ?? "");
+    const gated = new Promise<void>(resolve => { entered = resolve; });
+    const origin = await fixtureServer(t, (request, response) => {
+      if (request.url === "/gate") { gate = response; entered(); return; }
       response.writeHead(200, { "Content-Type": "text/html", "Cache-Control": "no-store" });
       response.end(`<!doctype html><title>${request.url}</title><main>Original fixture</main>`);
     });
-    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-    const address = server.address();
-    assert(address && typeof address !== "string");
-    const origin = `http://127.0.0.1:${address.port}`;
-    const create = BrowserProcessLauncher.create;
-    const launches = t.mock.method(BrowserProcessLauncher, "create", create);
-    const set = createBrowserTool({ profileDir: path.join(root, "manual"), artifactDir: path.join(root, "artifacts"), browser: browser === "chromium" ? "firefox" : "chromium", headless: true });
+    t.after(() => { gate?.end(); });
+    const source = { browser: engine, profileDir: path.join(root, "profile"), headless: true };
+    const client = new BrowserClient({ source, session: "A", idleMs: 300 });
+    const other = new BrowserClient({ source, session: "B", idleMs: 300 });
+    t.after(() => Promise.all([client.close(), other.close()]));
+    const snapshots = new SnapshotStore({ directory: path.join(root, "snapshots") });
+    const set = createBrowserTool({ browser: () => client, snapshots });
     const execute = (params: Params, signal?: AbortSignal) => set.tool.execute("test", params, signal, undefined, context);
-    t.after(async () => {
-      gate?.end();
-      await set.close();
-      server.closeAllConnections();
-      await new Promise<void>(resolve => server.close(() => resolve()));
-      await rm(root, { recursive: true, force: true });
-    });
-    assert(Check(set.tool.parameters, { browser, url: origin, eval: "1" }));
-    assert(!Check(set.tool.parameters, { session_id: "default" }));
-    assert(!Check(set.tool.parameters, { backend: "browser" }));
-    for (const params of [{ remote: "../escape" }, { url: "file:///etc/passwd" }, { url: "https://user:pass@example.com" }]) {
-      await assert.rejects(execute(params));
-    }
-    assert.equal(launches.mock.callCount(), 0);
-    const [first, second] = await Promise.all([
-      execute({ browser, url: `${origin}/one`, eval: "document.querySelector('main').textContent = 'Edited fixture'" }),
-      execute({ eval: "document.querySelector('main').textContent" }),
-    ]);
-    assert.equal(launches.mock.callCount(), 1, "same-destination concurrent calls share one process/profile request");
-    assert.equal(second.details.eval_result, "Edited fixture");
-    assert.equal(first.details.tab_id, second.details.tab_id);
-    const firstSnapshot = await set.snapshots.info(first.details.snapshot);
-    assert.deepEqual(firstSnapshot.available, ["md", "text", "html", "json", "screenshot", "before-screenshot"]);
-    assert.match(await readFile(firstSnapshot.paths.html!, "utf8"), /Edited fixture/);
-    assert.doesNotMatch(JSON.stringify(first.content), /before_html|after_html|\/tmp\//);
-    for (const file of Object.values(firstSnapshot.paths)) assert.equal((await stat(file)).mode & 0o777, 0o600);
-    assert.equal((await stat(path.dirname(firstSnapshot.paths.html!))).mode & 0o777, 0o700);
-    assert.deepEqual([...(await readFile(firstSnapshot.paths.screenshot!)).subarray(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10]);
-    await assert.rejects(execute({ browser: browser === "chromium" ? "firefox" : "chromium", url: `${origin}/wrong` }), /Use \/browser-close before changing its engine/);
-    assert.equal((await execute({ eval: "document.querySelector('main').textContent" })).details.eval_result, "Edited fixture");
-    assert(!navigations.includes("/wrong"));
-    assert.equal(launches.mock.callCount(), 1);
-    const thrown = await execute({ eval: "(() => { throw new Error('fixture eval failure'); })()" });
+    const page = async (params: Params, signal?: AbortSignal) => (await execute(params, signal)) as { content: { type: string; text?: string }[]; details: BrowserResultDetails };
+
+    assert(Check(set.tool.parameters, { tab: "docs", url: origin, eval: "1" }));
+    assert(Check(set.tool.parameters, { list: true }));
+    for (const params of [{ browser: engine }, { remote: "desk" }, { session_id: "default" }]) assert(!Check(set.tool.parameters, params));
+    for (const params of [{ url: "file:///etc/passwd" }, { url: "https://user:pass@example.com" }]) await assert.rejects(execute(params), /HTTP\(S\) without embedded credentials/);
+    await assert.rejects(execute({ list: true, tab: "docs" }), /list cannot be combined/);
+    assert.deepEqual(await brokerPids(root), [], "invalid calls start no browser");
+    await assert.rejects(execute({ eval: "1" }), /This session has no tab yet/);
+
+    const first = await page({ url: `${origin}/one?x=1`, eval: "document.querySelector('main').textContent = 'Edited fixture'" });
+    const name = `127.0.0.1:${new URL(origin).port}+7`;
+    assert.equal(first.details.tab, name);
+    assert.equal(first.details.browser, engine);
+    assert.equal(first.details.url, `${origin}/one?x=1`);
+    assert.match(text(first), new RegExp(`Tab: ${name.replaceAll(".", "\\.").replace("+", "\\+")} \\(new\\) in ${engine}`));
+    assert.match(text(first), new RegExp(`Page: /one\\?x=1 — ${origin}/one\\?x=1`.replaceAll("/", "\\/")));
+    const saved = await snapshots.info(first.details.snapshot);
+    assert.deepEqual(saved.available, ["md", "text", "html", "json", "screenshot", "before-screenshot"]);
+    assert.match(await readFile(saved.paths.html!, "utf8"), /Edited fixture/);
+    assert.doesNotMatch(text(first), /\/tmp\//);
+    for (const file of Object.values(saved.paths)) assert.equal((await stat(file)).mode & 0o777, 0o600);
+    assert.deepEqual([...(await readFile(saved.paths.screenshot!)).subarray(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10]);
+
+    const same = await page({ eval: "document.querySelector('main').textContent" });
+    assert.equal(same.details.eval_result, "Edited fixture", "an omitted tab is this session's last tab");
+    assert.doesNotMatch(text(same), /\(new\)/);
+    const thrown = await page({ eval: "(() => { throw new Error('fixture eval failure'); })()" });
     assert.match(thrown.details.eval_error ?? "", /fixture eval failure/);
-    assert.equal(thrown.details.tab_id, first.details.tab_id);
-    assert.match((await set.snapshots.read(thrown.details.snapshot, "html")).text!, /Edited fixture/);
+    assert.equal(thrown.details.tab, name, "ordinary eval errors keep the tab");
     for (const expression of ["'x'.repeat(60 * 1024)", "Array.from({ length: 2200 }, (_, i) => i)"]) {
-      const result = await execute({ eval: expression });
+      const result = await page({ eval: expression });
       assert.equal(result.details.truncated, true);
-      assert.equal(result.content[0]!.type, "text");
-      if (result.content[0]!.type !== "text") throw new Error("Expected text output");
-      assert.match(result.content[0]!.text, /preview truncated; full captured result/);
-      assert(Buffer.byteLength(result.content[0]!.text) < 9 * 1024);
-      const saved = JSON.parse(await readFile((await set.snapshots.info(result.details.snapshot)).paths.json!, "utf8"));
-      assert.deepEqual(saved.metadata.eval_result, expression.startsWith("'x'") ? "x".repeat(60 * 1024) : Array.from({ length: 2200 }, (_, i) => i));
+      assert.match(text(result), /preview truncated; full captured result/);
+      assert(Buffer.byteLength(text(result)) < 9 * 1024);
+      const json = JSON.parse(await readFile((await snapshots.info(result.details.snapshot)).paths.json!, "utf8"));
+      assert.deepEqual(json.metadata.eval_result, expression.startsWith("'x'") ? "x".repeat(60 * 1024) : Array.from({ length: 2200 }, (_, i) => i));
       assert.equal(result.details.eval_result, undefined, "large results are not duplicated in details");
     }
 
-    // Hold real asynchronous JavaScript at a local HTTP gate, not a timing guess.
-    const running = execute({ eval: "(async () => { await fetch('/gate'); document.title = 'eval completed'; return document.title; })()" });
-    await entered.promise;
-    let finished = false;
-    void running.then(() => { finished = true; });
+    await assert.rejects(execute({ tab: "docs" }), /Unknown tab "docs"/);
+    const docs = await page({ tab: "docs", url: `${origin}/docs`, eval: "document.title" });
+    assert.deepEqual([docs.details.tab, docs.details.eval_result], ["docs", "/docs"]);
+    assert.equal((await page({ eval: "document.title" })).details.tab, "docs", "the newest tab becomes the default");
+    const back = await page({ tab: name, eval: "location.search" });
+    assert.equal(back.details.eval_result, "?x=1");
+
+    // Another session may use any tab; this session's next call is warned.
+    const { tab } = await other.open({ tab: name });
+    await tab.evaluate("document.title = 'changed by B'");
+    await tab.release();
+    const warned = await page({ eval: "document.title" });
+    assert.equal(warned.details.eval_result, "changed by B");
+    assert.match(warned.details.warnings?.[0] ?? "", /used by session B/);
+    assert.match(text(warned), /Warning: Tab .* was used by session B/);
+
+    const listed = await execute({ list: true });
+    const tabs = (listed.details as BrowserListDetails).tabs;
+    assert.deepEqual(tabs.map(tab => tab.name).sort(), ["docs", name].sort());
+    assert.match(text(listed), new RegExp(`^\\* ${name.replaceAll(".", "\\.").replace("+", "\\+")} — changed by B — ${origin}/one\\?x=1 — last used by this session`, "m"));
+    assert.match(text(listed), /^ {2}docs — \/docs — .* — last used by this session at /m);
+
+    // Interrupting a running evaluation closes only its tab and saves pre-eval evidence.
     const abort = new AbortController();
-    const cancelled = execute({ url: `${origin}/cancelled`, eval: "document.title = 'wrong'" }, abort.signal);
-    const checked = assert.rejects(cancelled, /queued cancelled/);
-    const navigation = execute({ url: `${origin}/two`, eval: "document.title" });
-    abort.abort(new Error("queued cancelled"));
-    await Promise.race([checked, delay(1000).then(() => { throw new Error("Queued cancellation did not settle promptly"); })]);
-    assert.equal(finished, false);
-    assert(!navigations.includes("/two"), "navigation must wait for the earlier evaluation and captures");
-    gate!.end("continue");
-    assert.equal((await running).details.title, "eval completed");
-    assert.equal((await navigation).details.eval_result, "/two");
-    assert(!navigations.includes("/cancelled"));
-    assert.equal(launches.mock.callCount(), 1, "queued cancellation never closes the running tab");
-
-    // /browser-close must be in the same queue, including calls submitted while
-    // it waits. A new operation must never run on a closing owner or lose its slot.
-    entered = deferred();
-    const beforeClose = execute({ eval: "fetch('/gate').then(() => 'before close')" });
-    await entered.promise;
-    const close = set.closeBrowser();
-    const reopened = execute({ browser, url: `${origin}/reopened`, eval: "document.title" });
-    gate!.end("continue");
-    assert.equal((await beforeClose).details.eval_result, "before close");
-    await close;
-    const restored = await reopened;
-    assert.equal(restored.details.title, "/reopened");
-    assert.equal(launches.mock.callCount(), 2);
-
-    // Simulate an external close of this disposable process, never a user's
-    // browser. The profile lease records the exact process created by this test.
-    const ownerFile = path.join(root, "manual", browser, ".pi-browser-owner", "owner.json");
-    const owner = JSON.parse(await readFile(ownerFile, "utf8"));
-    assert.equal(owner.pid, process.pid);
-    assert.equal(typeof owner.browserPid, "number");
-    process.kill(owner.browserPid, "SIGTERM");
-    for (let attempt = 0; attempt < 100; attempt++) {
-      try { await stat(ownerFile); } catch { break; }
-      await delay(50);
-    }
-    const manualRecovery = await execute({ url: `${origin}/manual-recovery`, eval: "document.title" });
-    assert.equal(manualRecovery.details.title, "/manual-recovery");
-    assert.equal(manualRecovery.details.browser, browser, "recovery retains the destination's engine, not the host default");
-    assert.notEqual(manualRecovery.details.tab_id, restored.details.tab_id);
-
-    entered = deferred();
-    const interrupted = execute({ eval: "fetch('/gate').then(() => { document.title = 'must not resume'; })" });
-    let interruptedSnapshot = "";
-    const interruption = assert.rejects(interrupted, (error: unknown) => {
+    const interrupted = execute({ eval: "fetch('/gate').then(() => 'must not finish')" }, abort.signal);
+    let snapshot = "";
+    const rejected = assert.rejects(interrupted, (error: unknown) => {
       assert(error instanceof Error);
-      assert.match(error.message, /cancelled.*closed|cancelled.*stopped/i);
-      interruptedSnapshot = /Snapshot: (snap_[a-f0-9]{32})/.exec(error.message)?.[1] ?? "";
-      assert(interruptedSnapshot);
+      assert.match(error.message, /tab closed to terminate running JavaScript/);
+      snapshot = /Snapshot: (snap_[a-f0-9]{32})/.exec(error.message)?.[1] ?? "";
       return true;
     });
-    await entered.promise;
-    const shutdown = set.close();
-    assert.equal(shutdown, set.close(), "cleanup is idempotent");
-    await assert.rejects(execute({}), /closed/);
-    await assert.rejects(set.closeBrowser(), /closed/);
-    await interruption;
-    const interruptedInfo = await set.snapshots.info(interruptedSnapshot);
+    await gated;
+    abort.abort(new Error("fixture cancellation"));
+    await rejected;
+    const interruptedInfo = await snapshots.info(snapshot);
     assert(interruptedInfo.available.includes("before-screenshot"));
     assert(!interruptedInfo.available.includes("screenshot"), "cancelled eval must not capture a fake final image");
-    await shutdown;
-    const profiles = await readdir(path.join(root, "manual", browser));
-    assert(!profiles.includes(".pi-browser-owner"));
+    assert.equal((await page({ tab: "docs", eval: "document.title" })).details.eval_result, "/docs", "other tabs remain");
+    await assert.rejects(execute({ tab: name }), /Unknown tab/);
+  });
+}
+
+test("a closed last tab without a url is an error; with a url a new tab opens and says so", { timeout: 60_000 }, async t => {
+  const root = await isolateBrokers(t);
+  let started!: () => void;
+  const running = new Promise<void>(resolve => { started = resolve; });
+  const origin = await fixtureServer(t, (request, response) => {
+    if (request.url === "/started") started();
+    response.setHeader("Content-Type", "text/html");
+    response.end(`<!doctype html><title>${request.url}</title>`);
+  });
+  const client = new BrowserClient({ source: { browser: "chromium", profileDir: path.join(root, "profile"), headless: true }, session: "A", idleMs: 300 });
+  t.after(() => client.close());
+  const set = createBrowserTool({ browser: () => client, snapshots: new SnapshotStore({ directory: path.join(root, "snapshots") }) });
+  const execute = (params: Params, signal?: AbortSignal) => set.tool.execute("test", params, signal, undefined, context);
+  await execute({ tab: "only", url: `${origin}/first` });
+  const abort = new AbortController();
+  const hung = assert.rejects(execute({ eval: "fetch('/started').then(() => new Promise(() => {}))" }, abort.signal), /tab closed/);
+  await running;
+  abort.abort();
+  await hung;
+  await assert.rejects(execute({ eval: "document.title" }), /Your last tab "only" was closed\. Give a url/);
+  const reopened = await execute({ url: `${origin}/second`, eval: "document.title" });
+  assert.match(text(reopened), /Warning: Your last tab "only" was closed; opened a new tab\./);
+  assert.equal((reopened.details as BrowserResultDetails).eval_result, "/second");
+  assert.match(text(reopened), /\(new\)/);
+});
+
+for (const engine of ["chromium", "firefox"] as const) {
+  test(`${engine}: concurrent calls on one tab from two sessions run whole calls in turn`, { timeout: 60_000 }, async t => {
+    const root = await isolateBrokers(t);
+    const origin = await fixtureServer(t, (request, response) => {
+      response.setHeader("Content-Type", "text/html");
+      response.end(`<!doctype html><title>${request.url}</title><main>Fixture</main>`);
+    });
+    const source = { browser: engine, profileDir: path.join(root, "profile"), headless: true };
+    const snapshots = new SnapshotStore({ directory: path.join(root, "snapshots") });
+    const sessions = ["A", "B"].map(session => {
+      const client = new BrowserClient({ source, session, idleMs: 300 });
+      t.after(() => client.close());
+      const set = createBrowserTool({ browser: () => client, snapshots });
+      return async (params: Params, signal?: AbortSignal) =>
+        (await set.tool.execute("test", params, signal, undefined, context)) as { content: { type: string; text?: string }[]; details: BrowserResultDetails };
+    });
+    const [a, b] = sessions as [typeof sessions[0], typeof sessions[0]];
+    await a({ tab: "shared", url: `${origin}/shared` });
+    // Each call logs its start and end with a pause between, then labels the page; its capture follows.
+    const step = (label: string) => `(async () => { (window.log ??= []).push('${label}-start'); await new Promise(r => setTimeout(r, 400)); window.log.push('${label}-end'); document.title = window.log.join(','); return window.log.join(','); })()`;
+    const first = a({ tab: "shared", eval: step("A") });
+    await new Promise(resolve => setTimeout(resolve, 100));
+    const cancel = new AbortController();
+    const cancelled = assert.rejects(a({ tab: "shared", eval: step("C") }, cancel.signal), /cancelled/);
+    await new Promise(resolve => setTimeout(resolve, 100));
+    // B navigates: interleaved, its navigation would replace the page before A's final capture.
+    const second = b({ tab: "shared", url: `${origin}/b`, eval: step("B") });
+    cancel.abort(new Error("waiting call cancelled"));
+    await cancelled;
+    const [one, two] = await Promise.all([first, second]);
+    assert.deepEqual([one.details.eval_result, one.details.title, one.details.url], ["A-start,A-end", "A-start,A-end", `${origin}/shared`],
+      "the holder's capture precedes the next call, and the cancelled waiter neither ran nor released it");
+    assert.deepEqual([two.details.eval_result, two.details.title, two.details.url], ["B-start,B-end", "B-start,B-end", `${origin}/b`]);
   });
 }

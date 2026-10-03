@@ -159,6 +159,6 @@ test("shutdown interrupts incomplete startup and retains its lease until the pro
 
 test("Firefox sandbox stays enabled and debug transports reject non-loopback endpoints", async () => {
   await assert.rejects(BrowserProcessLauncher.create({ browser: "firefox", profileDir: "/unused", headless: true, noSandbox: true }), /noSandbox/);
-  await assert.rejects(Cdp.connect("ws://example.com/devtools/browser/unsafe"), /loopback-only/);
-  await assert.rejects(Bidi.connect("ws://example.com/session"), /loopback-only/);
+  await assert.rejects(Cdp.connect("ws://example.com/devtools/browser/unsafe"), /must be a loopback WebSocket URL/);
+  await assert.rejects(Bidi.connect("ws://example.com/session"), /must be a loopback WebSocket URL/);
 });

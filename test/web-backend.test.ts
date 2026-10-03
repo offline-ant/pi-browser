@@ -5,9 +5,14 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
+import { BrowserClient } from "../src/broker/client.ts";
 import { BrowserResearch } from "../src/web/browser.ts";
 import { CODEX_ENDPOINT } from "../src/web/codex.ts";
 import { createWebTools, isWebBackend, type WebBackend, type WebBackendState, type WebSettings } from "../src/web/index.ts";
+import { fixtureClient, isolateBrokers } from "./helpers.ts";
+
+// BrowserResearch.run is mocked in policy tests; the client is never used.
+const unusedClient = fixtureClient(() => { throw new Error("No browser tab expected"); });
 
 const token = `test.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "test-account" } })).toString("base64url")}.test`;
 function context(auth: () => Promise<string | undefined> = async () => token): ExtensionToolContext {
@@ -35,7 +40,7 @@ test("backend state captures host/environment/default precedence and validates o
   for (const value of [undefined, null, "", "AUTO", "typo", 1, {}, ["browser"]]) assert.equal(isWebBackend(value), false);
 
   for (const fixture of [
-    { environment: undefined, host: undefined, configured: "auto", source: "default" },
+    { environment: undefined, host: undefined, configured: "browser", source: "default" },
     { environment: "browser", host: undefined, configured: "browser", source: "environment" },
     { environment: "browser", host: "codex", configured: "codex", source: "host" },
     { environment: "codex", host: "auto", configured: "auto", source: "host" },
@@ -80,7 +85,7 @@ test("backend state captures host/environment/default precedence and validates o
 });
 
 test("both web tools follow overrides without changing names, schemas, or actual-backend details", async t => {
-  const set = createWebTools({ settings: { backend: "auto" } });
+  const set = createWebTools({ settings: { backend: "auto" }, browser: () => unusedClient });
   t.after(() => set.close());
   assert.deepEqual(set.tools.map(tool => tool.name), ["web_search", "web_fetch", "web_read"]);
   assert.deepEqual(Object.keys(set.tools[0]!.parameters.properties), ["query", "max_results"]);
@@ -94,7 +99,7 @@ test("both web tools follow overrides without changing names, schemas, or actual
   const browsers: BrowserResearch[] = [];
   const browser = t.mock.method(BrowserResearch.prototype, "run", async function (this: BrowserResearch, kind: "search" | "fetch", value: string) {
     browsers.push(this);
-    return { output: `Faux browser ${kind}: ${value}`, url: "https://example.test/", title: "Fixture", tabId: "fixture", limitations: [] };
+    return { output: `Faux browser ${kind}: ${value}`, url: "https://example.test/", title: "Fixture", tab: "fixture", limitations: [] };
   });
   const close = t.mock.method(BrowserResearch.prototype, "close", async () => {});
   for (const override of ["browser", "codex", "auto", "browser"] as const) {
@@ -113,11 +118,11 @@ test("both web tools follow overrides without changing names, schemas, or actual
 });
 
 test("each invocation snapshots auto before Codex auth or transport yields; subsequent calls use the new policy", async t => {
-  t.mock.method(BrowserResearch.prototype, "run", async () => ({ output: "Faux fallback", url: "https://example.test/", title: "Fixture", tabId: "fixture", limitations: [] }));
+  t.mock.method(BrowserResearch.prototype, "run", async () => ({ output: "Faux fallback", url: "https://example.test/", title: "Fixture", tab: "fixture", limitations: [] }));
   for (const operation of operations) {
     for (const phase of ["auth", "request"] as const) {
       await t.test(`${operation.kind}: ${phase}`, async t => {
-        const set = createWebTools({ settings: { backend: "auto" } });
+        const set = createWebTools({ settings: { backend: "auto" }, browser: () => unusedClient });
         t.after(() => set.close());
         const entered = deferred<void>();
         const release = deferred<void>();
@@ -154,8 +159,10 @@ test("each invocation snapshots auto before Codex auth or transport yields; subs
   }
 });
 
-test("a live local challenge and queued browser call survive browser → codex → browser without tab reset", { timeout: 30_000 }, async t => {
+test("a live local challenge and queued browser call survive browser → codex → browser without tab reset", { timeout: 45_000 }, async t => {
+  await isolateBrokers(t);
   const root = await mkdtemp(path.join(tmpdir(), "pi-web-backend-"));
+  const client = new BrowserClient({ source: { browser: "firefox", profileDir: path.join(root, "profile"), headless: true }, session: "backend", idleMs: 300 });
   const waiting = deferred<void>();
   const continueAttention = deferred<boolean>();
   const corrected = deferred<void>();
@@ -192,12 +199,13 @@ test("a live local challenge and queued browser call survive browser → codex �
     return nativeFetch(url, init);
   });
   const set = createWebTools({
-    settings: { backend: "browser", browser: "firefox", headless: true, profileDir: root },
-    onAttention: async request => { attentionTab = request.tabId; waiting.resolve(); return continueAttention.promise; },
+    settings: { backend: "browser" }, browser: () => client,
+    onAttention: async request => { attentionTab = request.tab; waiting.resolve(); return continueAttention.promise; },
   });
   t.after(async () => {
     continueAttention.resolve(false);
     await set.close();
+    await client.close();
     await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
     await rm(root, { recursive: true, force: true });
   });
@@ -221,7 +229,8 @@ test("a live local challenge and queued browser call survive browser → codex �
   continueAttention.resolve(true);
   const resumed = await pending;
   assert.equal(resumed.details.backend, "browser");
-  assert.equal(resumed.details.tabId, attentionTab);
+  assert.equal(resumed.details.tab, attentionTab);
+  assert.match(JSON.stringify(resumed.content), new RegExp(`Tab: ${attentionTab.replaceAll(".", "\\.").replaceAll("+", "\\+")}`));
   assert.match(JSON.stringify(resumed.content), /Corrected live document with retained state/);
   assert.equal(navigations, 1, "continuation inspects the existing document without navigation");
   const queuedResult = await queued;

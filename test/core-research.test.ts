@@ -65,9 +65,10 @@ for (const kind of ["chromium", "firefox"] as const satisfies readonly BrowserKi
     assert.equal((await first.info()).url, `${origin}/destination#second`);
     assert.equal(await first.evaluate("window.sameDocumentMarker"), "retained", "fragment navigation preserves the document");
     assert.match(await first.html(), /<!DOCTYPE html>.*|Research fixture/s);
+    // Headless Chromium need not render background tabs; tools focus before screenshots.
+    await first.focus();
     const screenshot = Buffer.from(await first.screenshot(), "base64");
     assert.deepEqual([...screenshot.subarray(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10]);
-    await first.focus();
 
     const alreadyAborted = AbortSignal.abort(new Error("do not execute"));
     await assert.rejects(first.evaluate("window.marker = 'wrong'", { signal: alreadyAborted }), /do not execute/);
@@ -143,35 +144,47 @@ for (const kind of ["chromium", "firefox"] as const satisfies readonly BrowserKi
     await assert.rejects(first.evaluate("while (true) {}", { timeoutMs: 100 }), /timed out.*closed/);
     assert(Date.now() - timeoutStarted < 8_000, "hung-script cleanup is bounded");
     assert.equal(first.closed, true);
-    assert.equal(browser.closed, kind === "firefox");
-    assert.equal(sibling.closed, kind === "firefox");
-    if (kind === "chromium") {
-      await assert.rejects(first.evaluate("7"), /closed/);
-      assert.equal(await sibling.evaluate("9"), 9, "Chromium preserves other tabs when destroying the interrupted context");
-    } else {
-      await assert.rejects(first.evaluate("7"), /closed/);
-      await assert.rejects(sibling.evaluate("9"), /closed/);
-      await assert.rejects(browser.openTab(), /closed/);
-      browser = await launch();
-    }
+    assert.equal(browser.closed, false);
+    assert.equal(sibling.closed, false);
+    await assert.rejects(first.evaluate("7"), /closed/);
+    assert.equal(await sibling.evaluate("9"), 9, "interruption preserves other tabs");
+    assert(!(await browser.pages()).some(page => page.id === first.id), "the hung tab is really gone");
     const page = await browser.openTab(origin);
     const abort = new AbortController();
     const pending = page.evaluate("(async () => { await new Promise(resolve => setTimeout(resolve, 400)); await fetch('/resumed'); })()", { signal: abort.signal, timeoutMs: 20_000 });
-    const checked = assert.rejects(pending, kind === "firefox" ? /cancelled.*Firefox stopped/ : /cancelled.*Chromium tab closed/);
+    const checked = assert.rejects(pending, kind === "firefox" ? /cancelled.*Firefox tab closed/ : /cancelled.*Chromium tab closed/);
     await delay(50);
     const cancellationStarted = Date.now();
     abort.abort();
     await checked;
     assert(Date.now() - cancellationStarted < 8_000, "cancellation cleanup is bounded");
     assert.equal(page.closed, true);
-    assert.equal(browser.closed, kind === "firefox");
+    assert.equal(browser.closed, false);
     await assert.rejects(page.evaluate("11"), /closed/);
     await delay(450);
     assert.equal(resumed, false, "cancelled asynchronous JavaScript must not resume later");
 
-    if (kind === "firefox") browser = await launch();
+    await sibling.close();
     const unresolved = await browser.openTab();
     await assert.rejects(unresolved.evaluate("new Promise(() => {})", { timeoutMs: 100 }), /timed out.*closed/);
     await assert.rejects(unresolved.evaluate("13"), /closed/);
+    assert.deepEqual(await browser.pages(), [], "closing the last opened tab really closes it; the window's anchor tab stays hidden");
+    assert.equal(browser.closed, false);
+  });
+
+  test(`${kind}: pages hides the anchor tab and tab() reuses attached handles`, { timeout: 45_000 }, async t => {
+    const directory = await mkdtemp(path.join(tmpdir(), `pi-browser-pages-${kind}-`));
+    const browser = await launchBrowser({ browser: kind, profileDir: directory, headless: true,
+      ...(kind === "chromium" && process.env.PAGENT_TEST_NO_SANDBOX === "1" ? { noSandbox: true } : {}) });
+    t.after(async () => { await browser.close(); await rm(directory, { recursive: true, force: true }); });
+    assert.equal(browser.browser, kind);
+    assert.deepEqual(await browser.pages(), []);
+    const opened = await browser.openTab();
+    await opened.evaluate("document.title = 'opened'");
+    // Tabs opened by people or pages are listed too; see broker.test.ts.
+    const pages = await browser.pages();
+    assert.deepEqual(pages.map(page => page.id), [opened.id]);
+    const attached = await browser.tab(opened.id);
+    assert.equal(attached, opened, "an already attached page reuses its handle");
   });
 }

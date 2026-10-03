@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { chmod, mkdir, mkdtemp, open, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
-import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
@@ -11,11 +10,12 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall, InMemoryCredentialStore, InMemoryModelsStore, type JsonObject, type JsonValue } from "@earendil-works/pi-ai";
 import { Check } from "typebox/value";
+import { BrowserClient } from "../src/broker/client.ts";
 import browserExtension from "../src/extension.ts";
-import { BrowserProcessLauncher } from "../src/core/index.ts";
 import { CODEX_ENDPOINT } from "../src/web/codex.ts";
 import { SnapshotStore, WebAttentionRequired } from "../src/web/index.ts";
 import { copySnapshotTree } from "../src/snapshot-copy.ts";
+import { brokerPids, fixtureServer, isolateBrokers, waitFor } from "./helpers.ts";
 
 function isJsonObject(value: JsonValue | undefined): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -26,10 +26,11 @@ function snapshotId(result: { details: JsonObject }): string {
   return result.details.snapshot;
 }
 
+/** Isolated agent directory and brokers; the latter are stopped after the test. */
 async function environment(t: TestContext, settings: Record<string, string>) {
+  const brokers = await isolateBrokers(t);
   const root = await mkdtemp(path.join(tmpdir(), "pi-browser-extension-"));
-  const values = { PI_CODING_AGENT_DIR: root, PI_WEB_PROFILE_DIR: undefined, PI_BROWSER_EXECUTABLE: undefined,
-    PI_WEB_BACKEND: "codex", PI_WEB_BROWSER: "chromium", PI_BROWSER_HEADLESS: "true", ...settings };
+  const values = { PI_CODING_AGENT_DIR: root, PI_WEB_BACKEND: "codex", PI_BROWSER: "chromium", PI_BROWSER_HEADLESS: "true", ...settings };
   const previous = new Map(Object.keys(values).map(key => [key, process.env[key]]));
   for (const [key, value] of Object.entries(values)) {
     if (value === undefined) delete process.env[key]; else process.env[key] = value;
@@ -39,7 +40,7 @@ async function environment(t: TestContext, settings: Record<string, string>) {
       if (value === undefined) delete process.env[key]; else process.env[key] = value;
     }
   });
-  return root;
+  return { root, brokers };
 }
 
 async function sdk(root: string, confirm?: ExtensionUIContext["confirm"], options: Pick<CreateAgentSessionOptions, "sessionManager" | "sessionStartEvent"> = {}) {
@@ -95,8 +96,7 @@ async function sdk(root: string, confirm?: ExtensionUIContext["confirm"], option
 }
 
 test("static registration is lazy, Codex-only never requests a browser, and shutdown rejects stale execution", async t => {
-  const root = await environment(t, {});
-  const launches = t.mock.method(BrowserProcessLauncher, "create", async () => { throw new Error("No browser launch is permitted"); });
+  const { root, brokers } = await environment(t, {});
   const token = `test.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "fixture" } })).toString("base64url")}.test`;
   t.mock.method(ModelRegistry.prototype, "getApiKeyForProvider", async () => token);
   const transport = t.mock.method(globalThis, "fetch", async (url: string | URL | Request) => {
@@ -105,7 +105,6 @@ test("static registration is lazy, Codex-only never requests a browser, and shut
   });
   const host = await sdk(root);
   try {
-    assert.equal(launches.mock.callCount(), 0);
     assert.equal(transport.mock.callCount(), 0);
     await assert.rejects(stat(host.snapshots.directory), { code: "ENOENT" }, "registration and session_start leave storage lazy");
     for (const definition of host.definitions) {
@@ -116,19 +115,18 @@ test("static registration is lazy, Codex-only never requests a browser, and shut
     assert.equal(fetched.details.backend, "codex");
     assert.match(JSON.stringify((await host.run("web_read", { snapshot: fetched.details.snapshot })).content), /Fixture source/);
     assert.equal(transport.mock.callCount(), 2, "web_read makes no transport request");
-    assert.equal(launches.mock.callCount(), 0);
-    assert.deepEqual(await readdir(path.join(root, "browser", host.session.sessionId)), ["snapshots"], "Codex saves evidence but creates no browser profiles");
+    assert.deepEqual(await readdir(path.join(root, "browser")), [host.session.sessionId], "Codex saves evidence but creates no browser profiles");
+    assert.deepEqual(await readdir(path.join(root, "browser", host.session.sessionId)), ["snapshots"]);
     const context = host.session.extensionRunner.createToolContext("late", undefined);
     await host.session.extensionRunner.emit({ type: "session_shutdown", reason: "reload" });
     const browser = host.definitions.find(tool => tool.name === "browser")!;
     await assert.rejects(async () => browser.execute("late", {}, undefined, undefined, context), /shut down/);
-    assert.equal(launches.mock.callCount(), 0);
+    assert.deepEqual(await brokerPids(brokers), [], "no browser broker was started");
   } finally { await host.close(); await rm(root, { recursive: true, force: true }); }
 });
 
-test("snapshot evidence and cursors survive reload and fork without copying profiles", async t => {
-  const root = await environment(t, {});
-  const launches = t.mock.method(BrowserProcessLauncher, "create", async () => { throw new Error("No browser launch is permitted"); });
+test("snapshot evidence and cursors survive reload and fork without copying other session state", async t => {
+  const { root } = await environment(t, {});
   const token = `test.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "fixture" } })).toString("base64url")}.test`;
   t.mock.method(ModelRegistry.prototype, "getApiKeyForProvider", async () => token);
   const transport = t.mock.method(globalThis, "fetch", async () => Response.json({ output: `# Durable fixture\n${"Saved evidence. ".repeat(6000)}\nEnd of fixture.` }));
@@ -167,11 +165,10 @@ test("snapshot evidence and cursors survive reload and fork without copying prof
   hosts.push(independent);
   await assert.rejects(independent.snapshots.info(snapshot), /expired|not present/);
   assert.equal(transport.mock.callCount(), 1);
-  assert.equal(launches.mock.callCount(), 0);
 });
 
 test("failed snapshot fork blocks tools instead of silently starting an empty store", async t => {
-  const root = await environment(t, {});
+  const { root } = await environment(t, {});
   const parent = SessionManager.create(root, path.join(root, "sessions"));
   parent.appendMessage(fauxAssistantMessage("Parent fixture."));
   const source = new SnapshotStore({ directory: path.join(root, "browser", parent.getSessionId(), "snapshots") });
@@ -229,13 +226,19 @@ test("snapshot copying excludes pending state and rejects links, active locks, a
   await assert.rejects(stat(lock), { code: "ENOENT" }, "failed copies release their own source lock");
 });
 
-test("browser-default retains the destination engine and engine-specific research", { timeout: 90_000 }, async t => {
-  const root = await environment(t, { PI_WEB_BACKEND: "browser", PI_WEB_BROWSER: "chromium" });
+/** A later client sees the tabs Pi sessions left behind; disconnected sessions' tabs close. */
+async function remainingTabs(root: string, browser: "chromium" | "firefox") {
+  const check = new BrowserClient({ source: { browser, profileDir: path.join(root, "browser", "profiles", browser), headless: true }, session: "check" });
+  try { return await check.list(); } finally { await check.close(); }
+}
+
+test("/browser selects the browser shared by browser and web tools; each browser keeps its tabs and cookies", { timeout: 120_000 }, async t => {
+  const { root, brokers } = await environment(t, { PI_WEB_BACKEND: "browser", PI_BROWSER: "chromium" });
   let solved = false;
   let corrected!: () => void;
   const correction = new Promise<void>(resolve => { corrected = resolve; });
   let attentionNavigations = 0;
-  const server = createServer((request, response) => {
+  const origin = await fixtureServer(t, (request, response) => {
     response.setHeader("Cache-Control", "no-store");
     if (request.url === "/state") { response.end(String(solved)); return; }
     if (request.url === "/corrected") { corrected(); response.end("ok"); return; }
@@ -251,91 +254,70 @@ test("browser-default retains the destination engine and engine-specific researc
       </script>`);
     } else {
       if (request.url === "/seed") response.setHeader("Set-Cookie", "research=firefox; Path=/; SameSite=Lax");
-      response.end(`<!doctype html><title>Local article</title><main><h1>Local article</h1><p>Cookie: ${request.headers.cookie ?? "none"}</p></main>`);
+      response.end(`<!doctype html><title>Local article ${request.url}</title><main><h1>Local article</h1><p>Cookie: ${request.headers.cookie ?? "none"}</p></main>`);
     }
   });
-  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-  const address = server.address();
-  assert(address && typeof address !== "string");
-  const origin = `http://127.0.0.1:${address.port}`;
-  const launches = t.mock.method(BrowserProcessLauncher, "create", BrowserProcessLauncher.create);
   const host = await sdk(root);
-  t.after(async () => {
-    await host.close();
-    server.closeAllConnections();
-    await new Promise<void>(resolve => server.close(() => resolve()));
-    await rm(root, { recursive: true, force: true });
-  });
-  await host.session.prompt("/browser-default firefox");
-  await host.session.prompt("/browser-default status");
-  assert.equal(launches.mock.callCount(), 0, "selecting and reporting an engine starts no browser");
+  t.after(() => host.close());
+  await host.session.prompt("/browser firefox");
+  await host.session.prompt("/browser status");
+  assert.deepEqual(await brokerPids(brokers), [], "selecting and reporting a browser starts nothing");
   const firefox = await host.run("browser", { url: origin,
     eval: "document.querySelector('main').textContent = 'Retained manual edit'; document.title = 'Edited Firefox'; document.title" });
   assert.equal(firefox.details.browser, "firefox");
-  assert.equal((await host.run("web_fetch", { url: `${origin}/seed` })).details.browser, "firefox");
+  const seeded = await host.run("web_fetch", { url: `${origin}/seed` });
+  assert(typeof seeded.details.tab === "string");
+  assert.match(JSON.stringify(seeded.content), new RegExp(`Tab: ${seeded.details.tab.replaceAll(".", "\\.").replace("+", "\\+")}`));
+  const inspected = await host.run("browser", { tab: seeded.details.tab, eval: "document.cookie" });
+  assert.equal(inspected.details.eval_result, "research=firefox", "research tabs live in the same browser as the browser tool");
   const fetchTool = host.definitions.find(tool => tool.name === "web_fetch")!;
   let pendingTab = "";
   await assert.rejects(fetchTool.execute("attention", { url: `${origin}/attention` }, undefined, undefined,
     host.session.extensionRunner.createToolContext("attention", undefined)), error => {
     assert(error instanceof WebAttentionRequired);
-    pendingTab = error.tabId;
+    pendingTab = error.tab;
     return true;
   });
   assert.equal(attentionNavigations, 1);
 
-  await host.session.prompt("/browser-default chromium");
+  await host.session.prompt("/browser chromium");
   const chromiumResearch = await host.run("web_fetch", { url: `${origin}/cookies` });
-  assert.equal(chromiumResearch.details.browser, "chromium");
-  assert.match(JSON.stringify(chromiumResearch.content), /Cookie: none/, "engines have separate research cookies");
-  const retained = await host.run("browser", { eval: "document.querySelector('main').textContent" });
-  assert.equal(retained.details.browser, "firefox");
-  assert.equal(retained.details.tab_id, firefox.details.tab_id);
-  assert.equal(retained.details.title, "Edited Firefox");
-  assert.equal(retained.details.eval_result, "Retained manual edit");
-  await host.session.prompt("/browser-close");
-  const explicit = await host.run("browser", { browser: "firefox", url: origin });
-  assert.equal(explicit.details.browser, "firefox", "explicit engine overrides the default after closing");
-  await host.session.prompt("/browser-close");
-  const chromium = await host.run("browser", { url: origin });
-  assert.equal(chromium.details.browser, "chromium", "reopening uses the current default");
+  assert.match(JSON.stringify(chromiumResearch.content), /Cookie: none/, "browsers have separate profiles");
+  const followUp = await host.run("browser", { eval: "document.title" });
+  assert.deepEqual([followUp.details.browser, followUp.details.tab, followUp.details.eval_result],
+    ["chromium", chromiumResearch.details.tab, "Local article /cookies"], "the last research tab is this session's default tab");
+  assert.equal((await brokerPids(brokers)).length, 2);
 
-  const beforeCommands = launches.mock.callCount();
-  await host.session.prompt("/browser-default firefox");
+  await host.session.prompt("/browser firefox");
+  const retained = await host.run("browser", { tab: firefox.details.tab as string, eval: "document.querySelector('main').textContent" });
+  assert.deepEqual([retained.details.title, retained.details.eval_result], ["Edited Firefox", "Retained manual edit"]);
   const firefoxResearch = await host.run("web_fetch", { url: `${origin}/cookies` });
-  assert.equal(firefoxResearch.details.browser, "firefox");
   assert.match(JSON.stringify(firefoxResearch.content), /Cookie: research=firefox/);
   solved = true;
   await correction;
   const resumed = await host.run("web_fetch", { url: `${origin}/attention` });
-  assert.equal(resumed.details.tabId, pendingTab, "switching back resumes the original pending tab");
+  assert.equal(resumed.details.tab, pendingTab, "switching back resumes the original pending tab");
   assert.match(JSON.stringify(resumed.content), /Retained research document/);
   assert.equal(attentionNavigations, 1, "retry does not navigate over retained research state");
-  await host.session.prompt("/browser-default reset");
-  await host.session.prompt("/browser-default status");
-  assert.equal(launches.mock.callCount(), beforeCommands, "switch-back, reset and status do not launch replacement browsers");
-
-  const base = path.join(root, "browser", host.session.sessionId);
-  const owners: { file: string; browserPid: number }[] = [];
-  for (const profile of ["manual/chromium", "research/firefox", "research/chromium"]) {
-    const file = path.join(base, profile, ".pi-browser-owner", "owner.json");
-    const owner = JSON.parse(await readFile(file, "utf8"));
-    assert.equal(owner.pid, process.pid);
-    owners.push({ file, browserPid: owner.browserPid });
+  await host.session.prompt("/browser reset");
+  await host.session.prompt("/browser status");
+  assert.equal((await brokerPids(brokers)).length, 2, "switching and reset start no further browsers");
+  for (const browser of ["firefox", "chromium"]) {
+    const owner = JSON.parse(await readFile(path.join(root, "browser", "profiles", browser, ".pi-browser-owner", "owner.json"), "utf8"));
+    assert((await brokerPids(brokers)).includes(owner.pid), "each stable profile is held by its broker");
   }
-  assert.equal(new Set(owners.map(owner => owner.browserPid)).size, 3);
   await host.close();
-  for (const owner of owners) {
-    await assert.rejects(stat(owner.file), { code: "ENOENT" });
-    assert.throws(() => process.kill(owner.browserPid, 0), { code: "ESRCH" });
+  for (const browser of ["firefox", "chromium"] as const) {
+    await waitFor(async () => (await remainingTabs(root, browser)).length === 0, 10_000, `${browser} tabs to close after shutdown`);
   }
 });
 
 for (const browser of ["chromium", "firefox"] as const) {
-  test(`${browser}: faux SDK uses isolated manual/research profiles, attention UI and shutdown cleanup`, { timeout: 90_000 }, async t => {
-    const root = await environment(t, { PI_WEB_BACKEND: "browser", PI_WEB_BROWSER: browser });
+  test(`${browser}: two Pi sessions share one browser and its tabs; evidence and attention stay per session`, { timeout: 120_000 }, async t => {
+    const { root, brokers } = await environment(t, { PI_WEB_BACKEND: "browser", PI_BROWSER: browser });
     let solved = false;
     let attentionNavigations = 0;
-    const server = createServer((request, response) => {
+    const origin = await fixtureServer(t, (request, response) => {
       if (request.url === "/state") { response.end(String(solved)); return; }
       response.setHeader("Content-Type", "text/html");
       if (request.url === "/attention") {
@@ -347,10 +329,6 @@ for (const browser of ["chromium", "firefox"] as const) {
         </script>`);
       } else response.end("<!doctype html><title>Local article</title><main><h1>Local article</h1><p>Readable local fixture content for research.</p></main>");
     });
-    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-    const address = server.address();
-    assert(address && typeof address !== "string");
-    const origin = `http://127.0.0.1:${address.port}`;
     let confirmations = 0;
     const first = await sdk(root, async (title, message, options) => {
       confirmations++;
@@ -364,25 +342,23 @@ for (const browser of ["chromium", "firefox"] as const) {
       return true;
     });
     const second = await sdk(root);
-    t.after(async () => {
-      await Promise.all([first.close(), second.close()]);
-      server.closeAllConnections();
-      await new Promise<void>(resolve => server.close(() => resolve()));
-      await rm(root, { recursive: true, force: true });
-    });
-    const launches = t.mock.method(BrowserProcessLauncher, "create", BrowserProcessLauncher.create);
+    t.after(() => Promise.all([first.close(), second.close()]));
     const firstManual = await first.run("browser", { url: origin, eval: "document.cookie = 'owner=first;path=/'; document.title = 'Manual edit'; document.title" });
-    const secondManual = await second.run("browser", { url: origin, eval: "document.cookie" });
-    assert.equal(secondManual.details.eval_result, "", "different Pi sessions do not share cookies");
-    assert.notEqual(firstManual.details.snapshot, secondManual.details.snapshot);
+    const name = firstManual.details.tab as string;
     assert.equal(firstManual.details.browser, browser);
-    assert(!("after_html" in firstManual.details));
-    assert(!("before_screenshot" in firstManual.details));
+    const secondManual = await second.run("browser", { url: origin, eval: "document.cookie" });
+    assert.equal(secondManual.details.eval_result, "owner=first", "sessions share one stable profile");
+    assert.equal(secondManual.details.tab, `${name}-2`, "a new session gets its own automatically named tab");
+    assert.equal((await brokerPids(brokers)).length, 1, "both sessions use one broker and browser");
+    const listed = await second.run("browser", { list: true });
+    assert.match(JSON.stringify(listed.content), new RegExp(`${name.replaceAll(".", "\\.").replace("+", "\\+")} — Manual edit — .* — last used by ${first.session.sessionId}`));
+    assert.equal((await second.run("browser", { tab: name, eval: "document.title" })).details.eval_result, "Manual edit");
+    assert.match(JSON.stringify((await first.run("browser", { eval: "document.title" })).content), new RegExp(`Warning: Tab .* was used by session ${second.session.sessionId}`));
     assert(!JSON.stringify(firstManual.content).includes(root));
     const manualEvidence = await first.snapshots.info(snapshotId(firstManual));
     const otherEvidence = await second.snapshots.info(snapshotId(secondManual));
     assert.notEqual(path.dirname(manualEvidence.paths.html!), path.dirname(otherEvidence.paths.html!));
-    const readOnlyLaunches = launches.mock.callCount();
+    await assert.rejects(second.snapshots.info(snapshotId(firstManual)), /expired|not present/, "evidence stays per session");
     const html = await first.run("web_read", { snapshot: firstManual.details.snapshot, format: "html" });
     assert.match(JSON.stringify(html.content), /Manual edit/);
     for (const format of ["screenshot", "before-screenshot"]) {
@@ -390,42 +366,20 @@ for (const browser of ["chromium", "firefox"] as const) {
       assert(image.content.some(block => block.type === "image" && block.mimeType === "image/png"));
     }
     assert.match(JSON.stringify((await first.run("read", { path: manualEvidence.paths.html! })).content), /Manual edit/);
-    assert((await first.run("read", { path: manualEvidence.paths.screenshot! })).content.some(block => block.type === "image"));
-    assert.equal(launches.mock.callCount(), readOnlyLaunches, "saved HTML/image reads never launch another browser");
     const noUIFetch = second.definitions.find(tool => tool.name === "web_fetch")!;
     await assert.rejects(noUIFetch.execute("no-ui", { url: `${origin}/attention` }, undefined, undefined,
       second.session.extensionRunner.createToolContext("no-ui", undefined)), WebAttentionRequired);
     const attention = await first.run("web_fetch", { url: `${origin}/attention` });
     assert.equal(attention.details.backend, "browser");
     assert.match(JSON.stringify(attention.content), /Human supplied readable article/);
-    const fetchedLaunches = launches.mock.callCount();
     assert.match(JSON.stringify((await first.run("web_read", { snapshot: attention.details.snapshot })).content), /Human supplied readable article/);
-    assert((await first.run("web_read", { snapshot: attention.details.snapshot, format: "screenshot" })).content.some(block => block.type === "image"));
-    assert.equal(launches.mock.callCount(), fetchedLaunches, "fetch-to-read uses saved evidence");
     assert.equal(confirmations, 1);
     assert.equal(attentionNavigations, 2, "each session navigates once; Continue never repeats navigation");
     await second.run("web_fetch", { url: `${origin}/attention` });
     assert.equal(attentionNavigations, 2, "a no-UI retry also resumes its retained page");
-    assert.equal((await first.run("browser", { eval: "document.title" })).details.eval_result, "Manual edit", "research never navigates the manual browser");
-    const owners: { file: string; browserPid: number }[] = [];
-    for (const host of [first, second]) {
-      const base = path.join(root, "browser", host.session.sessionId);
-      for (const profile of [path.join(base, "manual", browser), path.join(base, "research", browser)]) {
-        const file = path.join(profile, ".pi-browser-owner", "owner.json");
-        const owner = JSON.parse(await readFile(file, "utf8"));
-        assert.equal(owner.pid, process.pid);
-        owners.push({ file, browserPid: owner.browserPid });
-      }
-    }
-    assert.equal(new Set(owners.map(owner => owner.browserPid)).size, 4, "manual/research and Pi sessions have distinct processes");
-    await first.session.prompt("/browser-close");
-    await assert.rejects(stat(owners[0]!.file), { code: "ENOENT" });
-    await stat(owners[1]!.file); // Manual close does not close research.
+    assert.equal((await first.run("browser", { tab: name, eval: "document.title" })).details.eval_result, "Manual edit", "research never navigates browser-tool tabs");
     await Promise.all([first.close(), second.close()]);
-    for (const owner of owners) {
-      await assert.rejects(stat(owner.file), { code: "ENOENT" });
-      assert.throws(() => process.kill(owner.browserPid, 0), { code: "ESRCH" });
-    }
+    await waitFor(async () => (await remainingTabs(root, browser)).length === 0, 10_000, "tabs to close after both sessions shut down");
     assert.match(await readFile(manualEvidence.paths.html!, "utf8"), /Manual edit/);
     assert.equal((await first.snapshots.read(snapshotId(firstManual), "screenshot")).image?.mimeType, "image/png", "shutdown preserves evidence");
   });

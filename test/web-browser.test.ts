@@ -5,12 +5,14 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
-import { launchBrowser, type BrowserSession, type BrowserTab } from "../src/core/index.ts";
+import { BrowserClient } from "../src/broker/client.ts";
+import { launchBrowser } from "../src/core/index.ts";
 import { BrowserResearch, WebAttentionRequired } from "../src/web/browser.ts";
 import { captureExpression, inspectionExpression, type PageInspection } from "../src/web/extract.ts";
 import { createWebTools } from "../src/web/index.ts";
 import { CODEX_ENDPOINT } from "../src/web/codex.ts";
 import { resolveWebSettings } from "../src/web/settings.ts";
+import { fixtureClient, isolateBrokers, type ResearchTab } from "./helpers.ts";
 
 function inspection(patch: Partial<PageInspection> = {}): PageInspection {
   return { url: "https://example.com/", title: "Example", ready: true, noResults: false, results: [], markdown: "# Example\n\nVisible article.", limitations: [], ...patch };
@@ -19,16 +21,14 @@ function inspection(patch: Partial<PageInspection> = {}): PageInspection {
 test("attention Continue/retry preserves the tab and never repeats navigation; cancellation leaves it intact", async t => {
   let current = inspection({ attention: "Complete the challenge manually." });
   let navigations = 0;
-  let closed = false;
-  let launches = 0;
-  const tab: BrowserTab = {
-    id: "owned-tab", closed: false, navigate: async () => { navigations++; }, evaluate: async expression => expression === captureExpression()
+  let opened = 0;
+  const tab: ResearchTab = {
+    name: "example.com", closed: false, navigate: async () => { navigations++; }, evaluate: async expression => expression === captureExpression()
       ? { html: "<main>Fixture</main>", md: current.markdown, text: current.markdown, json: { ...current }, warnings: [], capturedAt: new Date().toISOString() }
       : current,
-    info: async () => ({ url: current.url, title: current.title }), screenshot: async () => "", html: async () => "", focus: async () => {}, close: async () => {},
+    screenshot: async () => "", focus: async () => {},
   };
-  const browser: BrowserSession = { get closed() { return closed; }, openTab: async () => tab, close: async () => { closed = true; } };
-  const research = new BrowserResearch(resolveWebSettings({}, {}), async () => { launches++; return browser; });
+  const research = new BrowserResearch(resolveWebSettings({}, {}), fixtureClient(() => { opened++; return tab; }));
   t.after(() => research.close());
   await assert.rejects(research.run("fetch", "https://example.com/", 5), WebAttentionRequired);
   assert.equal(navigations, 1);
@@ -38,7 +38,7 @@ test("attention Continue/retry preserves the tab and never repeats navigation; c
   assert.equal(navigations, 1);
   current = inspection({ attention: "Sign in manually." });
   const continued = await research.run("fetch", "https://example.com/second", 5, undefined, async request => {
-    assert.equal(request.tabId, "owned-tab");
+    assert.equal(request.tab, "example.com");
     assert.ok(request.id);
     current = inspection({ markdown: "User corrected this page.", url: "https://example.com/corrected" });
     return true;
@@ -54,13 +54,11 @@ test("attention Continue/retry preserves the tab and never repeats navigation; c
   await ready;
   abort.abort(new Error("cancel attention"));
   await rejected;
-  assert.equal(closed, false);
-  assert.equal(launches, 1);
+  assert.equal(opened, 3, "cancellation leaves the waiting tab for its retry");
   current = inspection();
   await research.run("fetch", "https://example.com/cancel", 5);
   assert.equal(navigations, 3);
-  await research.close();
-  assert.equal(closed, true);
+  assert.equal(opened, 3);
 });
 
 test("real browser DOM extraction preserves shadow code, links, lists, tables, and engine snippets", async t => {
@@ -110,7 +108,10 @@ test("real browser DOM extraction preserves shadow code, links, lists, tables, a
       } finally { await browser.close(); }
     });
   }
-  await t.test("browser-only skips auth, waits for SPA, and auto fallback reports the cause without caching failure", async () => {
+  await t.test("browser-only skips auth, waits for SPA, and auto fallback reports the cause without caching failure", async t => {
+    await isolateBrokers(t);
+    const client = new BrowserClient({ source: { browser: "firefox", profileDir: path.join(root, "research"), headless: true }, session: "web", idleMs: 300 });
+    t.after(() => client.close());
     const nativeFetch = globalThis.fetch;
     let status = 503;
     let codexCalls = 0;
@@ -121,8 +122,8 @@ test("real browser DOM extraction preserves shadow code, links, lists, tables, a
     });
     const token = `test.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "test" } })).toString("base64url")}.test`;
     const ctx = { modelRegistry: { getApiKeyForProvider: async () => token }, model: undefined } as unknown as ExtensionToolContext;
-    const browserOnly = createWebTools({ profileDir: path.join(root, "only"), settings: { backend: "browser", browser: "firefox", headless: true } });
-    const auto = createWebTools({ profileDir: path.join(root, "auto"), settings: { backend: "auto", browser: "firefox", headless: true } });
+    const browserOnly = createWebTools({ browser: () => client, settings: { backend: "browser" } });
+    const auto = createWebTools({ browser: () => client, settings: { backend: "auto" } });
     try {
       const forbidden = { modelRegistry: { getApiKeyForProvider: async () => { throw new Error("auth must not be called"); } }, model: undefined } as unknown as ExtensionToolContext;
       const spa = await browserOnly.tools[1]!.execute("spa", { url: `${base}/spa` }, undefined, undefined, forbidden);

@@ -228,5 +228,10 @@ export class ProtocolTab implements BrowserTab {
     });
   }
 
+  /** Chromium cannot close a page whose script never yields; stop the script first. Firefox closes it directly. */
+  async terminateExecution(): Promise<void> {
+    await this.cdp?.request("Runtime.terminateExecution", {}, 2_000);
+  }
+
   close(): Promise<void> { return this.session.closeTab(this); }
 }

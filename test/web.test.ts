@@ -8,6 +8,8 @@ import { Check } from "typebox/value";
 import { createWebTools, SnapshotStore } from "../src/web/index.ts";
 import { CODEX_ENDPOINT, CodexUnavailable, formatCodex, runCodex } from "../src/web/codex.ts";
 import { resolveWebSettings } from "../src/web/settings.ts";
+import { BrowserResearch } from "../src/web/browser.ts";
+import { fixtureClient } from "./helpers.ts";
 
 const token = `test.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "test-account" } })).toString("base64url")}.test`;
 function context(auth: () => Promise<string | undefined> = async () => token): ExtensionToolContext {
@@ -20,20 +22,58 @@ function isolateCredentials(t: TestContext, directory: string): void {
 }
 
 test("web settings are host-only, validated, and default to Codex-first auto", () => {
-  const defaults = resolveWebSettings({}, {});
-  assert.equal(defaults.backend, "auto");
-  assert.equal(defaults.browser, "chromium");
-  assert.equal(defaults.searchEngine, "duckduckgo");
-  assert.equal(defaults.headless, false);
-  assert.notEqual(defaults.profileDir, resolveWebSettings({}, {}).profileDir, "anonymous SDK clients need independent profile leases");
-  assert.equal(resolveWebSettings({}, {}, "/tmp/host-profile").profileDir, "/tmp/host-profile");
-  const env = { PI_WEB_BACKEND: "browser", PI_WEB_BROWSER: "firefox", PI_WEB_SEARCH_ENGINE: "bing", PI_BROWSER_HEADLESS: "1", PI_WEB_PROFILE_DIR: "/tmp/profile" };
-  assert.deepEqual(resolveWebSettings({}, env), { backend: "browser", browser: "firefox", searchEngine: "bing", headless: true, profileDir: "/tmp/profile" });
+  assert.deepEqual(resolveWebSettings({}, {}), { backend: "browser", searchEngine: "duckduckgo" });
+  const env = { PI_WEB_BACKEND: "browser", PI_WEB_SEARCH_ENGINE: "bing" };
+  assert.deepEqual(resolveWebSettings({}, env), { backend: "browser", searchEngine: "bing" });
   assert.equal(resolveWebSettings({ backend: "codex" }, env).backend, "codex");
-  assert.equal(resolveWebSettings({}, env, "/tmp/host-profile").profileDir, "/tmp/profile");
-  for (const environment of [{ PI_WEB_BACKEND: "typo" }, { PI_WEB_BROWSER: "chrome" }, { PI_WEB_SEARCH_ENGINE: "typo" }, { PI_BROWSER_HEADLESS: "yes" }, { PI_WEB_PROFILE_DIR: "" }, { PI_BROWSER_EXECUTABLE: "" }]) {
-    assert.throws(() => resolveWebSettings({}, environment));
-  }
+  for (const environment of [{ PI_WEB_BACKEND: "typo" }, { PI_WEB_SEARCH_ENGINE: "typo" }]) assert.throws(() => resolveWebSettings({}, environment));
+});
+
+test("browser research uses the host's browser, resolved per call before Codex yields, with one research owner per browser", async t => {
+  const result = { output: "Mock research", url: "https://example.test/", title: "Fixture", tab: "example.test", limitations: [] };
+  const owners: BrowserResearch[] = [];
+  t.mock.method(BrowserResearch.prototype, "run", async function (this: BrowserResearch) { owners.push(this); return result; });
+  const closed: BrowserResearch[] = [];
+  t.mock.method(BrowserResearch.prototype, "close", async function (this: BrowserResearch) {
+    closed.push(this);
+    if (this === owners[0]) throw new Error("fixture cleanup failure");
+  });
+  t.mock.method(globalThis, "fetch", async () => new Response("unavailable", { status: 503 }));
+  const clients = [0, 1].map(() => fixtureClient(() => { throw new Error("research is mocked"); }));
+  let selected = clients[0]!;
+  let resolutions = 0;
+  const browser = () => { resolutions++; return selected; };
+  const codex = createWebTools({ settings: { backend: "codex" }, browser });
+  t.after(() => codex.close());
+  await assert.rejects(codex.tools[1].execute("codex", { url: "https://example.test/" }, undefined, undefined, context(async () => undefined)), /No OpenAI Codex OAuth/);
+  assert.equal(resolutions, 0, "Codex-only never asks for a browser");
+  const missing = createWebTools({ settings: { backend: "browser" } });
+  t.after(() => missing.close());
+  await assert.rejects(missing.tools[1].execute("missing", { url: "https://example.test/" }, undefined, undefined, context()), /this host supplied no browser/);
+
+  const web = createWebTools({ settings: { backend: "auto" }, browser });
+  let release!: () => void;
+  const released = new Promise<void>(resolve => { release = resolve; });
+  let entered!: () => void;
+  const waiting = new Promise<void>(resolve => { entered = resolve; });
+  const pending = web.tools[1].execute("pending", { url: "https://example.test/" }, undefined, undefined, context(async () => { entered(); await released; return token; }));
+  await waiting;
+  selected = clients[1]!;
+  release();
+  const fallback = await pending;
+  assert.match(fallback.details.fallbackReason ?? "", /503/);
+  assert.equal(fallback.details.tab, "example.test");
+  assert.match(JSON.stringify(fallback.content), /Tab: example\.test/);
+  await web.tools[0].execute("second", { query: "fixture" }, undefined, undefined, context());
+  selected = clients[0]!;
+  await web.tools[0].execute("back", { query: "fixture" }, undefined, undefined, context());
+  assert.equal(owners[0], owners[2], "the browser was chosen before authentication yielded");
+  assert.notEqual(owners[0], owners[1]);
+  const closing = web.close();
+  assert.equal(web.close(), closing, "shutdown remains idempotent after failure");
+  await assert.rejects(closing, (error: unknown) => error instanceof AggregateError && /fixture cleanup failure/.test(String(error.errors[0])));
+  assert.deepEqual(new Set(closed), new Set(owners));
+  assert.equal(closed.length, 2, "every research owner is closed even when one fails");
 });
 
 test("Codex web tools preserve request/auth semantics, surface errors, and do not expose backend arguments", async t => {
@@ -149,7 +189,8 @@ test("Codex web tools preserve request/auth semantics, surface errors, and do no
     respond = async () => new Response("unavailable", { status: 503 });
     const failed = createWebTools({ settings: { backend: "auto" }, onProgress: () => { throw new Error("progress failure"); } });
     const abort = new AbortController();
-    const cancelled = createWebTools({ settings: { backend: "auto" }, onProgress: () => abort.abort(new Error("cancelled by progress")) });
+    const cancelled = createWebTools({ settings: { backend: "auto" }, onProgress: () => abort.abort(new Error("cancelled by progress")),
+      browser: () => fixtureClient(() => { throw new Error("No research tab may open after cancellation"); }) });
     try {
       await assert.rejects(failed.tools[0]!.execute("progress", { query: "query" }, undefined, undefined, context()), /progress failure/);
       await assert.rejects(cancelled.tools[0]!.execute("cancel-progress", { query: "query" }, abort.signal, undefined, context()), /cancelled by progress/);
