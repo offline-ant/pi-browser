@@ -404,11 +404,21 @@ have `name`, `closed`, `navigate`, `evaluate`, `screenshot`, and `focus`. The ho
 owns and closes clients; `createWebTools` resolves its `browser` function per
 call and never closes it. Without `browser`, browser-backed research is an error.
 
-The root entry point contains no Pi imports. It exports typed browser sessions,
+The root entry point contains no Pi imports, and the Pi peer dependencies are
+optional, so a consumer of only the root entry installs just `ws`. It exports typed browser sessions,
 tabs, `launchBrowser(options)`, `connectBrowser({ socketPath, signal? })`, the
 reusable `BrowserProcessLauncher`, and `findBrowserExecutable(kind)`. Sessions
 create owned tabs (`openTab()`), list top-level pages (`pages()`), and attach to
-existing ones (`tab(id)`), which `close()` leaves open. `connectBrowser` attaches
+existing ones (`tab(id)`), which `close()` leaves open. A launched browser's
+`startupTab()` claims its startup tab as an owned tab instead of keeping it as the
+hidden window anchor, so a dedicated browser can have exactly one tab; closing it
+may stop the browser. Tabs expose `whenClosed`, and page exceptions reject with
+`ScriptError`. Chromium also supplies `onPage(listener)` for every new top-level
+page, `document()` with the current document's identity and URL read from the
+browser protocol (not page JavaScript), `evaluate(expression, { document })`,
+which runs only in that document and fails once it is replaced, and `reload()`,
+which resolves the new document. Evaluation carries no user gesture, so the popup
+blocker refuses `window.open`. Firefox has none of these yet. `connectBrowser` attaches
 through a Unix socket forwarding to the publisher's 127.0.0.1:9222 and detects the
 engine; `close()` releases owned tabs and the connection without stopping the
 external browser. Both engines keep the logical Host `127.0.0.1:9222` for
@@ -440,7 +450,7 @@ cd pi-browser
 npm ci --ignore-scripts
 npm run check
 npm run compile
-node --test --test-concurrency=1 test/core-process.test.ts test/core-research.test.ts
+node --test --test-concurrency=1 test/core-process.test.ts test/core-research.test.ts test/core-document.test.ts
 node --test --test-concurrency=1 test/web.test.ts test/web-browser.test.ts test/web-lifecycle.test.ts
 node --test test/snapshot-store.test.ts test/snapshot-regression.test.ts test/web-read.test.ts
 node --test --test-concurrency=1 test/capture.test.ts test/web-capture-expression.test.ts test/web-final-capture.test.ts

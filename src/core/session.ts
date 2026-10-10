@@ -22,6 +22,7 @@ export class BrowserConnection implements BrowserSession {
   private initial?: string;
   private tabs = new Map<string, ProtocolTab>();
   private tabIds = new Set<string>();
+  private pageListeners = new Set<(page: { id: string; url: string }) => void>();
   private opening = new Set<Promise<BrowserTab>>();
   private attaching = new Map<string, Promise<ProtocolTab>>();
   private closing?: Promise<void>;
@@ -51,6 +52,10 @@ export class BrowserConnection implements BrowserSession {
       signal?.throwIfAborted();
       cdp.onEvent((method, params) => {
         if (method === "Target.targetDestroyed" && typeof params.targetId === "string") this.destroyed(params.targetId);
+        const created = method === "Target.targetCreated" ? cdpObject(params.targetInfo) : undefined;
+        if (created?.type === "page" && typeof created.targetId === "string") {
+          for (const listener of this.pageListeners) listener({ id: created.targetId, url: String(created.url ?? "") });
+        }
       });
       await cdp.request("Target.setDiscoverTargets", { discover: true }, 5_000);
       signal?.throwIfAborted();
@@ -131,6 +136,22 @@ export class BrowserConnection implements BrowserSession {
       if (id) { this.tabs.get(id)?.dispose(); this.tabs.delete(id); await this.closeNativeTab(id).catch(() => {}); }
       throw error;
     }
+  }
+
+  /** A launched browser's sole startup tab, as an owned tab; the window then has no anchor. Closing it may stop the browser. */
+  startupTab(): Promise<BrowserTab> {
+    const id = this.initial;
+    if (!this.owned || !id) return Promise.reject(new Error("Only a launched browser has an unclaimed startup tab"));
+    this.initial = undefined;
+    this.tabIds.add(id);
+    return this.tab(id);
+  }
+
+  /** Chromium: calls `listener` for every new top-level page, including ones this session opens. */
+  onPage(listener: (page: { id: string; url: string }) => void): () => void {
+    if (!this.cdp) throw new Error("Watching page creation requires Chromium");
+    this.pageListeners.add(listener);
+    return () => this.pageListeners.delete(listener);
   }
 
   /** Top-level pages, including tabs opened by people or pages. The anchor tab is excluded. */
@@ -226,6 +247,7 @@ export class BrowserConnection implements BrowserSession {
   close(): Promise<void> {
     if (this.closing) return this.closing;
     this.isClosed = true;
+    this.pageListeners.clear();
     this.closing = (async () => {
       // Keep the transport alive until late creation/attachment replies can be
       // accounted for. No new open may start after isClosed was set.

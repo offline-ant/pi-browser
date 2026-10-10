@@ -24,6 +24,11 @@
     "@earendil-works/pi-ai": "*",
     "typebox": "*"
   },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": { "optional": true },
+    "@earendil-works/pi-ai": { "optional": true },
+    "typebox": { "optional": true }
+  },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "1.1.0",
     "@earendil-works/pi-ai": "1.1.0",

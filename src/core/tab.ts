@@ -6,6 +6,9 @@ import type { BrowserTab, OperationOptions } from "./types.ts";
 
 const DEFAULT_TIMEOUT = 15_000;
 
+/** The page's JavaScript threw or rejected; the tab and its document remain usable. */
+export class ScriptError extends Error {}
+
 function navigationUrl(input: string): string {
   const url = new URL(input);
   if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("Browser navigation requires HTTP or HTTPS");
@@ -58,8 +61,13 @@ export class ProtocolTab implements BrowserTab {
   private cdp?: CdpSession;
   private bidi?: Bidi;
   private unsubscribe?: () => void;
-  private readyNavigations = new Set<string>();
+  /** Loaded navigations; for Chromium, each maps to its document's main-world context at DOMContentLoaded. */
+  private readyNavigations = new Map<string, string | undefined>();
+  private context?: string;
   private frameId?: string;
+  private markClosed: () => void = () => {};
+  /** Resolves once the tab closes: manual or explicit closure, destructive interruption, or session closure. */
+  readonly whenClosed = new Promise<void>(resolve => { this.markClosed = resolve; });
   private queue: Promise<unknown> = Promise.resolve();
   private isClosed = false;
 
@@ -75,10 +83,16 @@ export class ProtocolTab implements BrowserTab {
   async initialize(): Promise<void> {
     if (this.cdp) {
       this.unsubscribe = this.cdp.onEvent((method, params) => {
+        // Target events arrive in renderer order: at a navigation's DOMContentLoaded the current
+        // main-world context belongs to that navigation's document.
         if (method === "Page.lifecycleEvent" && params.frameId === this.frameId && params.name === "DOMContentLoaded" && typeof params.loaderId === "string") {
-          this.readyNavigations.add(params.loaderId);
-          if (this.readyNavigations.size > 32) this.readyNavigations.delete(this.readyNavigations.values().next().value!);
-        }
+          this.ready(params.loaderId, this.context);
+        } else if (method === "Runtime.executionContextCreated") {
+          const context = cdpObject(params.context);
+          const aux = cdpObject(context.auxData);
+          if (aux.frameId === this.frameId && aux.isDefault === true && typeof context.uniqueId === "string") this.context = context.uniqueId;
+        } else if (method === "Runtime.executionContextsCleared"
+          || method === "Runtime.executionContextDestroyed" && params.executionContextUniqueId === this.context) this.context = undefined;
       });
       await this.cdp.request("Page.enable");
       const tree = await this.cdp.request("Page.getFrameTree");
@@ -88,11 +102,15 @@ export class ProtocolTab implements BrowserTab {
     } else if (this.bidi) {
       this.unsubscribe = this.bidi.onEvent((method, params) => {
         if ((method === "browsingContext.domContentLoaded" || method === "browsingContext.fragmentNavigated") && params.context === this.id && typeof params.navigation === "string") {
-          this.readyNavigations.add(params.navigation);
-          if (this.readyNavigations.size > 32) this.readyNavigations.delete(this.readyNavigations.values().next().value!);
+          this.ready(params.navigation, undefined);
         }
       });
     }
+  }
+
+  private ready(navigation: string, context: string | undefined): void {
+    this.readyNavigations.set(navigation, context);
+    if (this.readyNavigations.size > 32) this.readyNavigations.delete(this.readyNavigations.keys().next().value!);
   }
 
   dispose(): void {
@@ -100,6 +118,7 @@ export class ProtocolTab implements BrowserTab {
     this.isClosed = true;
     this.unsubscribe?.();
     this.cdp?.close();
+    this.markClosed();
   }
 
   private assertOpen(): void {
@@ -171,11 +190,12 @@ export class ProtocolTab implements BrowserTab {
         if (this.cdp) {
           const response = await this.cdp.request("Runtime.evaluate", {
             expression, awaitPromise: true, returnByValue: true,
+            ...(options.document === undefined ? {} : { uniqueContextId: options.document }),
           }, milliseconds + 3_000);
           if (response.exceptionDetails) {
             const exception = cdpObject(response.exceptionDetails);
             const description = cdpObject(exception.exception).description;
-            throw new Error(String(description ?? exception.text ?? "Browser JavaScript evaluation failed"));
+            throw new ScriptError(String(description ?? exception.text ?? "Browser JavaScript evaluation failed"));
           }
           const value = cdpObject(response.result);
           if ("value" in value) return value.value;
@@ -183,11 +203,12 @@ export class ProtocolTab implements BrowserTab {
           if ("unserializableValue" in value) return { type: value.type, value: value.unserializableValue };
           return { type: value.subtype ?? value.type, description: value.description };
         }
+        if (options.document !== undefined) throw new Error("Document-bound evaluation requires Chromium");
         const response = await this.bidi!.request("script.evaluate", {
           expression, target: { context: this.id }, awaitPromise: true, resultOwnership: "none",
           serializationOptions: { maxObjectDepth: 30, maxDomDepth: 0 },
         }, milliseconds + 3_000);
-        if (response.type === "exception") throw new Error(String(bidiObject(response.exceptionDetails).text ?? "Browser JavaScript evaluation failed"));
+        if (response.type === "exception") throw new ScriptError(String(bidiObject(response.exceptionDetails).text ?? "Browser JavaScript evaluation failed"));
         return bidiObject(response.result).type === "undefined" ? undefined : remoteValue(response.result);
       } catch (error) {
         if (this.session.attached && (this.cdp?.closed || this.bidi?.closed)) {
@@ -196,6 +217,43 @@ export class ProtocolTab implements BrowserTab {
         throw error;
       }
     }, options, () => this.session.interruptEvaluation(this));
+  }
+
+  /** Chromium: the current document's identity and URL, read from the browser protocol rather than page JavaScript. */
+  document(): Promise<{ id: string; url: string }> {
+    return this.operation(async () => this.currentDocument());
+  }
+
+  private async currentDocument(): Promise<{ id: string; url: string }> {
+    if (!this.cdp) throw new Error("Document identity requires Chromium");
+    const frame = cdpObject(cdpObject((await this.cdp.request("Page.getFrameTree")).frameTree).frame);
+    const id = typeof frame.loaderId === "string" ? this.readyNavigations.get(frame.loaderId) : undefined;
+    if (!id || typeof frame.url !== "string") throw new Error("The page document is not loaded");
+    return { id, url: frame.url + (typeof frame.urlFragment === "string" ? frame.urlFragment : "") };
+  }
+
+  /** Chromium: reloads the page and resolves the new document once its DOM is loaded. */
+  reload(options: OperationOptions = {}): Promise<{ id: string; url: string }> {
+    if (!this.cdp) return Promise.reject(new Error("Reload requires Chromium"));
+    const cdp = this.cdp;
+    return this.operation(effective => interruptible(async () => {
+      const deadline = Date.now() + timeout(effective);
+      let unsubscribe = () => {};
+      let loader: string | undefined;
+      try {
+        unsubscribe = cdp.onEvent((method, params) => {
+          const frame = cdpObject(params.frame);
+          if (method === "Page.frameNavigated" && frame.id === this.frameId && typeof frame.loaderId === "string") loader = frame.loaderId;
+        });
+        await cdp.request("Page.reload", {}, timeout(effective));
+        while (loader === undefined || !this.readyNavigations.has(loader)) {
+          this.assertOpen();
+          if (Date.now() >= deadline) throw new Error("Browser reload timed out");
+          await delay(20);
+        }
+      } finally { unsubscribe(); }
+      return this.currentDocument();
+    }, effective), options);
   }
 
   async info(): Promise<{ url: string; title: string }> {

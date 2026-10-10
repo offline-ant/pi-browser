@@ -21,6 +21,8 @@ export interface BrowserConnectOptions {
 export interface OperationOptions {
   signal?: AbortSignal;
   timeoutMs?: number;
+  /** Chromium: evaluate only in this document from `document()`; fails if it is gone. */
+  document?: string;
 }
 
 export interface BrowserSession {
@@ -32,6 +34,10 @@ export interface BrowserSession {
   pages(): Promise<{ id: string; url: string; title?: string }[]>;
   /** Use an existing page; attached pages are not closed by close(). */
   tab(id: string): Promise<BrowserTab>;
+  /** A launched browser's sole startup tab, as an owned tab; the window then has no anchor. Closing it may stop the browser. */
+  startupTab(): Promise<BrowserTab>;
+  /** Chromium: calls `listener` for every new top-level page, including ones this session opens. */
+  onPage(listener: (page: { id: string; url: string }) => void): () => void;
   /** Close owned tabs; stop the browser only when this session launched it. */
   close(): Promise<void>;
 }
@@ -40,9 +46,15 @@ export interface BrowserTab {
   readonly id: string;
   /** True after manual/explicit closure, destructive interruption, or session loss. */
   readonly closed: boolean;
+  /** Resolves once the tab closes: manual or explicit closure, destructive interruption, or session closure. */
+  readonly whenClosed: Promise<void>;
   navigate(url: string, options?: OperationOptions): Promise<void>;
-  /** Evaluate one expression; returned Promises are awaited in both engines. */
+  /** Evaluate one expression; returned Promises are awaited in both engines. Page exceptions reject with `ScriptError`. */
   evaluate(expression: string, options?: OperationOptions): Promise<unknown>;
+  /** Chromium: the current document's identity and URL, read from the browser protocol rather than page JavaScript. */
+  document(): Promise<{ id: string; url: string }>;
+  /** Chromium: reloads the page and resolves the new document once its DOM is loaded. */
+  reload(options?: OperationOptions): Promise<{ id: string; url: string }>;
   info(): Promise<{ url: string; title: string }>;
   /** Base64-encoded PNG. */
   screenshot(): Promise<string>;

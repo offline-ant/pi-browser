@@ -14,8 +14,8 @@ test("capturePage evaluates once and never obtains HTML, metadata or screenshots
   let calls = 0;
   const unexpected = async (): Promise<never> => { throw new Error("Separate observation is forbidden"); };
   const tab: BrowserTab = {
-    id: "capture", closed: false, navigate: unexpected, info: unexpected, html: unexpected,
-    screenshot: unexpected, focus: unexpected, close: unexpected,
+    id: "capture", closed: false, whenClosed: new Promise(() => {}), navigate: unexpected, info: unexpected, html: unexpected,
+    screenshot: unexpected, focus: unexpected, close: unexpected, document: unexpected, reload: unexpected,
     evaluate: async expression => { calls++; new Script(expression); return expected; },
   };
   assert.equal(await capturePage(tab), expected);
