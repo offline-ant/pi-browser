@@ -242,6 +242,13 @@ export class BrowserConnection implements BrowserSession {
     throw new Error(`${this.label} tab closed to terminate running JavaScript; other tabs retained`);
   }
 
+  kill(): void {
+    const child = this.owned?.runtime.child;
+    if (!child?.pid || child.exitCode !== null || child.signalCode !== null) return;
+    try { if (process.platform === "win32") child.kill("SIGKILL"); else process.kill(-child.pid, "SIGKILL"); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+  }
+
   private get label(): string { return this.kind === "chromium" ? "Chromium" : "Firefox"; }
 
   close(): Promise<void> {

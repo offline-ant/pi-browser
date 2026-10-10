@@ -40,6 +40,11 @@ export interface BrowserSession {
   onPage(listener: (page: { id: string; url: string }) => void): () => void;
   /** Close owned tabs; stop the browser only when this session launched it. */
   close(): Promise<void>;
+  /**
+   * Immediately ends a launched browser's process tree (SIGKILL to its own process group), without
+   * closing the connection or releasing the profile. For a host that is itself being terminated; prefer close().
+   */
+  kill(): void;
 }
 
 export interface BrowserTab {

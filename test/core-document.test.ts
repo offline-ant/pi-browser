@@ -66,3 +66,13 @@ test("chromium: a launched browser's startup tab is its only tab and exposes its
   await tab.whenClosed;
   assert.equal(tab.closed, true);
 });
+
+test("chromium: kill() ends a launched browser at once", { timeout: 20_000 }, async t => {
+  const directory = await mkdtemp(path.join(tmpdir(), "pi-browser-kill-"));
+  const browser = await launchBrowser({ browser: "chromium", profileDir: directory, headless: true });
+  t.after(async () => { await browser.close(); await rm(directory, { recursive: true, force: true }); });
+  const tab = await browser.startupTab();
+  browser.kill();
+  await tab.whenClosed;
+  assert.equal(browser.closed, true);
+});

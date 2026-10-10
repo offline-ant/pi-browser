@@ -418,7 +418,9 @@ page, `document()` with the current document's identity and URL read from the
 browser protocol (not page JavaScript), `evaluate(expression, { document })`,
 which runs only in that document and fails once it is replaced, and `reload()`,
 which resolves the new document. Evaluation carries no user gesture, so the popup
-blocker refuses `window.open`. Firefox has none of these yet. `connectBrowser` attaches
+blocker refuses `window.open`. Firefox has none of these yet. A launched
+browser runs in its own process group; a host that is itself being terminated
+calls `kill()` to end that group at once rather than leave it running. `connectBrowser` attaches
 through a Unix socket forwarding to the publisher's 127.0.0.1:9222 and detects the
 engine; `close()` releases owned tabs and the connection without stopping the
 external browser. Both engines keep the logical Host `127.0.0.1:9222` for
