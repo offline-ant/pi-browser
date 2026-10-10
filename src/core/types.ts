@@ -42,7 +42,8 @@ export interface BrowserSession {
   close(): Promise<void>;
   /**
    * Immediately ends a launched browser's process tree (SIGKILL to its own process group), without
-   * closing the connection or releasing the profile. For a host that is itself being terminated; prefer close().
+   * closing the connection or releasing the profile; close() afterwards. For a host being terminated, or one
+   * discarding the profile: a graceful close() alone can leave helper processes running for seconds.
    */
   kill(): void;
 }
