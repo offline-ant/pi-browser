@@ -20,6 +20,30 @@ test("tab names: host without www plus the length of everything after it", () =>
   assert.equal(tabName("not a url"), "tab");
 });
 
+test("joining a shared browser requires its launch display setting", async t => {
+  const root = await isolateBrokers(t);
+  // Hello happens before any browser launch, so these headed sources never open a window.
+  const profileDir = path.join(root, "profile");
+  const client = (session: string, x11Display?: string) => {
+    const connection = new BrowserClient({ source: { browser: "chromium", profileDir, headless: false, ...(x11Display === undefined ? {} : { x11Display }) }, session, idleMs: 300 });
+    t.after(() => connection.close());
+    return connection;
+  };
+  const hello = (connection: BrowserClient) => connection.request("release", { lease: 0 });
+  assert.equal(await hello(client("A", ":424242")), null);
+  assert.equal(await hello(client("B", ":424242")), null, "the same display joins");
+  await assert.rejects(hello(client("C", ":424243")), /started on X11 display :424242 by another session/);
+  await assert.rejects(hello(client("D")), /started on X11 display :424242 by another session/);
+  assert.equal((await brokerPids(root)).length, 1);
+
+  const detectedProfile = path.join(root, "detected");
+  const detected = new BrowserClient({ source: { browser: "firefox", profileDir: detectedProfile, headless: false }, session: "E", idleMs: 300 });
+  const explicit = new BrowserClient({ source: { browser: "firefox", profileDir: detectedProfile, headless: false, x11Display: ":424242" }, session: "F", idleMs: 300 });
+  t.after(() => Promise.all([detected.close(), explicit.close()]));
+  assert.equal(await hello(detected), null);
+  await assert.rejects(hello(explicit), /started on the detected display by another session/);
+});
+
 async function ownerOf(profileDir: string): Promise<{ pid: number; browserPid: number }> {
   return JSON.parse(await readFile(path.join(profileDir, ".pi-browser-owner", "owner.json"), "utf8"));
 }

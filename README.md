@@ -84,7 +84,9 @@ keyed by the profile's real path or the remote socket path. The broker exits
 normally (cookies flushed); a remote keeps running with only Pi-opened tabs closed.
 
 Launch settings are fixed by the session that started the broker; a session
-asking for a different headless mode gets an error rather than a second browser.
+asking for a different headless mode or X11 display setting gets an error rather
+than a second browser. Settings are compared as configured: an explicit display
+does not join a browser started on the detected display, even the same one.
 If a socket refuses connections and its recorded broker has exited, or a
 profile lock's recorded broker and browser processes have exited, the next
 session takes over automatically; a live owner is an error, never killed.
@@ -120,6 +122,7 @@ host or use Pi `/reload` after changing its process environment.
 | `PI_BROWSER` | `chromium` | `chromium`, `firefox`, `firefox-default-profile`, or `remote:<name>` |
 | `PI_WEB_SEARCH_ENGINE` | `duckduckgo` | `duckduckgo`, `bing`, or `brave` |
 | `PI_BROWSER_HEADLESS` | `false` | Explicit `true`/`1` or `false`/`0` |
+| `PI_BROWSER_X11_DISPLAY` | unset | Linux X11 display, such as `:99`, for locally launched headed browsers; unset detects the display |
 
 `auto` attempts Codex first for each call. Missing/expired credentials, unavailable
 or unsupported service/model, transport errors/timeouts, HTTP 429, and service
@@ -151,7 +154,16 @@ Sandboxes remain enabled. The low-level API permits an explicit Chromium-only
 On Linux, local X11 probing includes both abstract and filesystem sockets. A
 permission-denied Wayland or filesystem socket does not rule out a working
 abstract X11 connection. The launcher pins the reachable display backend for
-both engines, without changing permissions or X11 authorization. Headed Chromium
+both engines, without changing permissions or X11 authorization.
+
+`PI_BROWSER_X11_DISPLAY` keeps the shared browser off the desktop session, for
+example on a virtual VNC display where its tab activation cannot take desktop
+focus. Only that display is probed and passed to the browser process; inherited
+Wayland and `DISPLAY` are ignored, and Pi's own environment is unchanged. An
+unreachable display is an error, never a fallback to the desktop. Headless and
+remote browsers ignore it, as does Pagent; the library option is `x11Display`.
+
+Headed Chromium
 starts with a 1280×900 window so fresh profiles cannot default to an empty content
 viewport and hang screenshot capture; headless geometry is unchanged.
 
@@ -418,7 +430,7 @@ web.setBackendOverride(null); // Reset to the original configuration.
 ```
 
 `BrowserClient` starts the source's broker on first use (`source` is
-`{ browser, profileDir, headless? }` or `{ remote, socketPath }`) and offers
+`{ browser, profileDir, headless?, x11Display? }` or `{ remote, socketPath }`) and offers
 `open({ tab?, url?, create? })`, `list()`, and `close()`. Opened `SharedTab`s
 have `name`, `closed`, `navigate`, `evaluate`, `screenshot`, and `focus`. The host
 owns and closes clients; `createWebTools` resolves its `browser` function per

@@ -7,7 +7,7 @@ import type { BrowserKind } from "../core/types.ts";
 
 /** A browser the broker launches with a stable profile, or a published remote socket it attaches to. */
 export type BrowserSource =
-  | { browser: BrowserKind; profileDir: string; headless?: boolean }
+  | { browser: BrowserKind; profileDir: string; headless?: boolean; x11Display?: string }
   | { remote: string; socketPath: string };
 
 export interface TabInfo {
@@ -34,7 +34,7 @@ export interface OpenResult {
 }
 
 export type Request =
-  | { id: number; method: "hello"; params: { session: string; headless: boolean } }
+  | { id: number; method: "hello"; params: { session: string; headless: boolean; x11Display: string | null } }
   | { id: number; method: "open"; params: { tab?: string; id?: string; url?: string; create?: boolean } }
   | { id: number; method: "release"; params: { lease: number } }
   | { id: number; method: "list"; params: Record<string, never> }

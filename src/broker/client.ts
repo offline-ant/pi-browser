@@ -152,7 +152,8 @@ export class BrowserClient {
     connected.on("close", () => this.disconnected(connected));
     const id = this.nextId++;
     const hello = new Promise((resolve, reject) => this.pending.set(id, { resolve, reject }));
-    send(connected, { id, method: "hello", params: { session: this.options.session, headless: this.headless } });
+    send(connected, { id, method: "hello", params: { session: this.options.session, headless: this.headless,
+      x11Display: "browser" in this.source ? this.source.x11Display ?? null : null } });
     try { await hello; }
     catch (error) { connected.destroy(); throw error; }
     this.live = connected;

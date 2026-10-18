@@ -48,7 +48,19 @@ async function socketAvailable(address: string | { host: string; port: number })
 
 type DisplayBackend = "wayland" | "x11" | "native";
 
-async function availableDisplay(): Promise<DisplayBackend | undefined> {
+async function x11Reachable(display: string | undefined): Promise<boolean> {
+  const match = display?.match(/^(?:([^:]+))?:(\d+)(?:\.\d+)?$/);
+  if (!match) return false;
+  const host = match[1];
+  const number = Number(match[2]);
+  // Linux X11 clients try the abstract socket as well as the filesystem socket.
+  // The latter can deny access even while the abstract transport works normally.
+  return !host || host === "unix"
+    ? await socketAvailable(`\0/tmp/.X11-unix/X${number}`) || await socketAvailable(`/tmp/.X11-unix/X${number}`)
+    : await socketAvailable({ host, port: 6000 + number });
+}
+
+async function detectDisplayBackend(): Promise<DisplayBackend | undefined> {
   // Linux can have inherited, stale DISPLAY values (SSH/tmux/containers). Probe
   // the actual display socket instead of silently starting an invisible browser.
   if (process.platform !== "linux") return "native";
@@ -57,16 +69,20 @@ async function availableDisplay(): Promise<DisplayBackend | undefined> {
   if (wayland && (path.isAbsolute(wayland) || runtime)) {
     if (await socketAvailable(path.isAbsolute(wayland) ? wayland : path.join(runtime!, wayland))) return "wayland";
   }
-  const display = process.env.DISPLAY?.match(/^(?:([^:]+))?:(\d+)(?:\.\d+)?$/);
-  if (!display) return undefined;
-  const host = display[1];
-  const number = Number(display[2]);
-  // Linux X11 clients try the abstract socket as well as the filesystem socket.
-  // The latter can deny access even while the abstract transport works normally.
-  const reachable = !host || host === "unix"
-    ? await socketAvailable(`\0/tmp/.X11-unix/X${number}`) || await socketAvailable(`/tmp/.X11-unix/X${number}`)
-    : await socketAvailable({ host, port: 6000 + number });
-  return reachable ? "x11" : undefined;
+  return await x11Reachable(process.env.DISPLAY) ? "x11" : undefined;
+}
+
+/** An explicit X11 display is used exactly: never Wayland, the inherited DISPLAY, or a fallback. */
+async function displayBackend(options: LaunchOptions): Promise<DisplayBackend | undefined> {
+  if (options.headless) return undefined;
+  if (options.x11Display === undefined) {
+    const detected = await detectDisplayBackend();
+    if (!detected) throw new Error("No graphical display is reachable. Browser tools require a visible display; set headless explicitly only for unattended use or tests.");
+    return detected;
+  }
+  if (process.platform !== "linux") throw new Error("An explicit X11 display is supported only on Linux.");
+  if (!await x11Reachable(options.x11Display)) throw new Error(`X11 display ${JSON.stringify(options.x11Display)} is not reachable; start it or change the X11 display setting.`);
+  return "x11";
 }
 
 export async function findBrowserExecutable(kind: BrowserKind, requested = process.env[kind === "chromium" ? "CHROMIUM_BINARY" : "FIREFOX_BINARY"]): Promise<string | undefined> {
@@ -87,7 +103,7 @@ export class BrowserProcessLauncher {
   private kind: BrowserKind;
   private command: string;
   private lock: string;
-  private display?: DisplayBackend;
+  private displayBackend?: DisplayBackend;
   private current?: NativeBrowserProcess;
   private starting?: Promise<NativeBrowserProcess>;
   private startingChild?: ChildProcess;
@@ -95,22 +111,19 @@ export class BrowserProcessLauncher {
   private closed = false;
   private closing?: Promise<void>;
 
-  private constructor(options: LaunchOptions, kind: BrowserKind, command: string, lock: string, display?: DisplayBackend) {
+  private constructor(options: LaunchOptions, kind: BrowserKind, command: string, lock: string, displayBackend?: DisplayBackend) {
     this.options = options;
     this.kind = kind;
     this.command = command;
     this.lock = lock;
-    this.display = display;
+    this.displayBackend = displayBackend;
   }
 
   static async create(options: LaunchOptions): Promise<BrowserProcessLauncher> {
     const kind = options.browser ?? "chromium";
     if (kind !== "chromium" && kind !== "firefox") throw new Error("Unsupported browser. Use chromium or firefox.");
     if (kind === "firefox" && options.noSandbox) throw new Error("Firefox does not support noSandbox; keep its sandbox enabled");
-    const display = options.headless ? undefined : await availableDisplay();
-    if (!options.headless && !display) {
-      throw new Error("No graphical display is reachable. Browser tools require a visible display; set headless explicitly only for unattended use or tests.");
-    }
+    const backend = await displayBackend(options);
     const command = await findBrowserExecutable(kind, options.executable);
     if (!command) throw new BrowserLaunchError(`${kind === "firefox" ? "Firefox" : "Chromium"} executable not found; ask the host operator to check its configuration.`, `Requested executable: ${options.executable ?? process.env[kind === "chromium" ? "CHROMIUM_BINARY" : "FIREFOX_BINARY"] ?? kind}`);
     await mkdir(options.profileDir, { recursive: true, mode: 0o700 });
@@ -125,7 +138,7 @@ export class BrowserProcessLauncher {
     }
     try { await writeFile(path.join(lock, "owner.json"), JSON.stringify({ pid: process.pid, profileDir, createdAt: new Date().toISOString() }) + "\n", { mode: 0o600 }); }
     catch (error) { await rm(lock, { recursive: true, force: true }); throw error; }
-    return new BrowserProcessLauncher({ ...options, profileDir }, kind, command, lock, display);
+    return new BrowserProcessLauncher({ ...options, profileDir }, kind, command, lock, backend);
   }
 
   start(): Promise<NativeBrowserProcess> {
@@ -154,16 +167,17 @@ export class BrowserProcessLauncher {
     if (options.headless) args.push(this.kind === "chromium" ? "--headless=new" : "--headless");
     if (this.kind === "chromium") {
       if (options.noSandbox) args.push("--no-sandbox");
-      if (this.display === "wayland" || this.display === "x11") args.push(`--ozone-platform=${this.display}`);
+      if (this.displayBackend === "wayland" || this.displayBackend === "x11") args.push(`--ozone-platform=${this.displayBackend}`);
     }
     // Pin the reachable display. Inherited Wayland/GTK preferences can otherwise
     // choose a stale socket even though the X11 probe succeeded (and vice versa).
     const env = { ...process.env };
-    if (this.display === "x11") {
+    if (this.displayBackend === "x11") {
+      if (options.x11Display !== undefined) env.DISPLAY = options.x11Display;
       delete env.WAYLAND_DISPLAY;
       env.MOZ_ENABLE_WAYLAND = "0";
       env.GDK_BACKEND = "x11";
-    } else if (this.display === "wayland") {
+    } else if (this.displayBackend === "wayland") {
       delete env.DISPLAY;
       env.MOZ_ENABLE_WAYLAND = "1";
       env.GDK_BACKEND = "wayland";

@@ -105,6 +105,52 @@ test("headed launch pins the reachable display instead of stale inherited browse
   }
 });
 
+test("an explicit X11 display is used exactly, never the inherited Wayland or DISPLAY", { skip: process.platform !== "linux" }, async t => {
+  const root = await mkdtemp(path.join(tmpdir(), "pi-browser-explicit-x11-"));
+  const previous = { DISPLAY: process.env.DISPLAY, WAYLAND_DISPLAY: process.env.WAYLAND_DISPLAY, XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR };
+  const servers = [createServer(socket => socket.end()), createServer(socket => socket.end()), createServer(socket => socket.end())];
+  const [inherited, explicit, wayland] = servers as [ReturnType<typeof createServer>, ReturnType<typeof createServer>, ReturnType<typeof createServer>];
+  const displayOf = async (server: ReturnType<typeof createServer>) => {
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    assert(address && typeof address !== "string" && address.port > 6000);
+    return `127.0.0.1:${address.port - 6000}`;
+  };
+  const inheritedDisplay = await displayOf(inherited);
+  const explicitDisplay = await displayOf(explicit);
+  await new Promise<void>(resolve => wayland.listen(path.join(root, "wayland-live"), resolve));
+  t.after(async () => {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    await Promise.all(servers.map(server => new Promise<void>(resolve => server.close(() => resolve()))));
+    await rm(root, { recursive: true, force: true });
+  });
+  const captured = path.join(root, "captured.json");
+  const executable = path.join(root, "browser-fixture");
+  await writeFile(executable, `#!${process.execPath}\nimport { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(captured)}, JSON.stringify({args:process.argv.slice(2),display:process.env.DISPLAY,wayland:process.env.WAYLAND_DISPLAY,gtk:process.env.GDK_BACKEND,moz:process.env.MOZ_ENABLE_WAYLAND}));\n`, { mode: 0o700 });
+  process.env.XDG_RUNTIME_DIR = root;
+  process.env.WAYLAND_DISPLAY = "wayland-live";
+  process.env.DISPLAY = inheritedDisplay;
+  for (const browser of ["chromium", "firefox"] as const) {
+    const launcher = await BrowserProcessLauncher.create({ browser, profileDir: path.join(root, browser), executable, x11Display: explicitDisplay });
+    try {
+      await assert.rejects(launcher.start(), /exited during startup/);
+      const result = JSON.parse(await readFile(captured, "utf8"));
+      assert.deepEqual([result.display, result.wayland, result.gtk, result.moz], [explicitDisplay, undefined, "x11", "0"]);
+      if (browser === "chromium") assert(result.args.includes("--ozone-platform=x11"));
+    } finally { await launcher.close(); }
+  }
+  assert.deepEqual([process.env.DISPLAY, process.env.WAYLAND_DISPLAY], [inheritedDisplay, "wayland-live"], "only the browser's environment changes");
+  // Reachable Wayland and inherited X11 are never a fallback for an unavailable explicit display.
+  for (const x11Display of [":999999", "not-a-display"]) {
+    await assert.rejects(BrowserProcessLauncher.create({ profileDir: path.join(root, "unreachable"), executable, x11Display }),
+      new RegExp(`X11 display "${x11Display}" is not reachable`));
+  }
+  const headless = await BrowserProcessLauncher.create({ profileDir: path.join(root, "headless"), executable: "/bin/false", headless: true, x11Display: ":999999" });
+  await headless.close();
+});
+
 test("Linux abstract X11 is usable without a filesystem socket and with unavailable Wayland", { skip: process.platform !== "linux" }, async t => {
   const root = await mkdtemp(path.join(tmpdir(), "pi-browser-abstract-x11-"));
   const previous = { DISPLAY: process.env.DISPLAY, WAYLAND_DISPLAY: process.env.WAYLAND_DISPLAY, XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR };

@@ -45,14 +45,19 @@ export function browserHeadless(environment: NodeJS.ProcessEnv = process.env): b
   throw new Error("PI_BROWSER_HEADLESS must be true, false, 1, or 0.");
 }
 
+/** `x11Display`: the display for locally launched headed browsers, for example a virtual `:99`; unset detects the desktop's display. */
+export interface LocalLaunch { headless: boolean; x11Display?: string }
+
 /** Pi-owned profiles are stable across sessions; the default profile is this user's own Firefox profile. */
-export async function browserSource(choice: BrowserChoice, profiles: string, headless: boolean): Promise<BrowserSource> {
+export async function browserSource(choice: BrowserChoice, profiles: string, launch: LocalLaunch): Promise<BrowserSource> {
   if (choice.startsWith("remote:")) {
     const remote = choice.slice("remote:".length);
     return { remote, socketPath: remoteSocketPath(remote) };
   }
-  if (choice === "firefox-default-profile") return { browser: "firefox", profileDir: await firefoxDefaultProfile(), headless };
-  return { browser: choice as "chromium" | "firefox", profileDir: path.join(profiles, choice), headless };
+  const profileDir = choice === "firefox-default-profile" ? await firefoxDefaultProfile() : path.join(profiles, choice);
+  const browser = choice === "chromium" ? "chromium" : "firefox";
+  // Headless browsers use no display.
+  return { browser, profileDir, headless: launch.headless, ...(launch.headless || launch.x11Display === undefined ? {} : { x11Display: launch.x11Display }) };
 }
 
 /** profiles.ini: the single install default, else the single profile marked Default=1. */

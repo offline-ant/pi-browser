@@ -6,6 +6,8 @@ export interface BrowserOptions {
   profileDir: string;
   /** Defaults to false. A missing graphical display is an error, not a headless fallback. */
   headless?: boolean;
+  /** Linux, headed: use this X11 display (for example ":99") instead of detecting one; unreachable is an error. */
+  x11Display?: string;
   executable?: string;
   /** Explicit Chromium-only sandbox opt-out. */
   noSandbox?: boolean;

@@ -143,9 +143,16 @@ export class Broker {
 
   private async handle(client: Client, request: Request, signal: AbortSignal): Promise<unknown> {
     if (request.method === "hello") {
-      const launched = "browser" in this.options.source ? this.options.source.headless ?? false : false;
-      if ("browser" in this.options.source && request.params.headless !== launched) {
-        throw new Error(`This browser was started ${launched ? "headless" : "headed"} by another session; close that session or use the same headless setting.`);
+      const source = this.options.source;
+      if ("browser" in source) {
+        const headless = source.headless ?? false;
+        if (request.params.headless !== headless) {
+          throw new Error(`This browser was started ${headless ? "headless" : "headed"} by another session; close that session or use the same headless setting.`);
+        }
+        const x11Display = source.x11Display ?? null;
+        if (request.params.x11Display !== x11Display) {
+          throw new Error(`This browser was started ${x11Display === null ? "on the detected display" : `on X11 display ${x11Display}`} by another session; close the sessions using it or use the same X11 display setting.`);
+        }
       }
       if (typeof request.params.session !== "string" || !request.params.session) throw new Error("A session ID is required.");
       client.session = request.params.session;
@@ -184,7 +191,7 @@ export class Broker {
       try {
         if ("remote" in source) return await connectBrowser({ socketPath: source.socketPath });
         await releaseStaleProfile(source.profileDir);
-        return await launchBrowser({ browser: source.browser, profileDir: source.profileDir, headless: source.headless });
+        return await launchBrowser({ browser: source.browser, profileDir: source.profileDir, headless: source.headless, x11Display: source.x11Display });
       } catch (error) {
         this.browser = undefined;
         if (!("remote" in source)) throw new BrokerError(publicBrowserError(error), "browser-unavailable");

@@ -65,8 +65,12 @@ test("browser sources: stable Pi profiles per engine and named remote sockets", 
     await rm(agent, { recursive: true, force: true });
   });
   const profiles = path.join(agent, "browser", "profiles");
-  assert.deepEqual(await browserSource("chromium", profiles, true), { browser: "chromium", profileDir: path.join(profiles, "chromium"), headless: true });
-  assert.deepEqual(await browserSource("firefox", profiles, false), { browser: "firefox", profileDir: path.join(profiles, "firefox"), headless: false });
-  assert.deepEqual(await browserSource("remote:desk", profiles, true), { remote: "desk", socketPath: path.join(agent, "browser-sockets", "desk.sock") });
+  assert.deepEqual(await browserSource("chromium", profiles, { headless: true }), { browser: "chromium", profileDir: path.join(profiles, "chromium"), headless: true });
+  assert.deepEqual(await browserSource("firefox", profiles, { headless: false }), { browser: "firefox", profileDir: path.join(profiles, "firefox"), headless: false });
+  assert.deepEqual(await browserSource("remote:desk", profiles, { headless: true }), { remote: "desk", socketPath: path.join(agent, "browser-sockets", "desk.sock") });
+  // An X11 display applies only to locally launched headed browsers.
+  assert.deepEqual(await browserSource("chromium", profiles, { headless: false, x11Display: ":99" }), { browser: "chromium", profileDir: path.join(profiles, "chromium"), headless: false, x11Display: ":99" });
+  assert.deepEqual(await browserSource("firefox", profiles, { headless: true, x11Display: ":99" }), { browser: "firefox", profileDir: path.join(profiles, "firefox"), headless: true });
+  assert.deepEqual(await browserSource("remote:desk", profiles, { headless: false, x11Display: ":99" }), { remote: "desk", socketPath: path.join(agent, "browser-sockets", "desk.sock") });
   assert.equal((await stat(path.join(agent, "browser-sockets"))).mode & 0o777, 0o700);
 });

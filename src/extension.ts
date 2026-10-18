@@ -34,6 +34,7 @@ export default function browserExtension(pi: ExtensionAPI): void {
     const snapshots = new SnapshotStore({ directory: path.join(root, "snapshots") });
     const selection = createBrowserSelection();
     const headless = browserHeadless();
+    const x11Display = process.env.PI_BROWSER_X11_DISPLAY;
     const profiles = path.join(getAgentDir(), "browser", "profiles");
     const clients = new Map<BrowserChoice, Promise<BrowserClient>>();
     // One broker connection per selected browser, shared by browser and web tools so they share this session's tabs.
@@ -41,7 +42,7 @@ export default function browserExtension(pi: ExtensionAPI): void {
       const choice = selection.getState().effective;
       let client = clients.get(choice);
       if (!client) {
-        const created = browserSource(choice, profiles, headless).then(source => new BrowserClient({ source, session }));
+        const created = browserSource(choice, profiles, { headless, x11Display }).then(source => new BrowserClient({ source, session }));
         void created.catch(() => { if (clients.get(choice) === created) clients.delete(choice); });
         clients.set(choice, created);
         client = created;
