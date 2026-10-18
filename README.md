@@ -194,7 +194,7 @@ viewport and hang screenshot capture; headless geometry is unchanged.
 
 Selecting a remote (`/browser remote <name>` or `PI_BROWSER=remote:<name>`)
 makes `browser`, `web_search`, and `web_fetch` share that browser through its
-broker. Pagent's workspace browser is unaffected. The publisher runs a dedicated desktop browser with debugging on
+broker. Pagent's workspace browser is unaffected. The publisher runs Firefox with its chosen profile and debugging on
 **127.0.0.1:9222**, then SSHes **into the Pi host**, forwarding a private Unix
 socket to that debugging port. Pi never initiates SSH or launches a remote browser.
 This also works when Pi runs in a VM that cannot SSH outward.
@@ -210,8 +210,9 @@ In Pi, request setup instructions (the helper always publishes Firefox):
 The SSH target defaults to the Pi process's `username@hostname`. Supply an SSH
 alias or IP if that hostname is not reachable **from the publisher**. Overrides
 without `user@` retain the Pi username so SSH reaches the receiving account.
-No prompts or remote-name argument are needed. Setup prints discovered socket
-names; the helper derives its publisher name with `hostname` (for example,
+Setup needs no remote-name argument; profile selection happens later in the
+publisher terminal. Setup prints discovered socket names; the helper derives its
+publisher name with `hostname` (for example,
 `void-flip`). There is no registry or persistent remote selector.
 
 Setup lazily creates `getAgentDir()/browser-sockets/` with mode `0700` and installs
@@ -229,19 +230,38 @@ The helper accepts just one optional argument, an SSH target override:
 embedded receiving socket directory. No IP enumeration or network scan is needed.
 
 The publisher needs Firefox, `curl`, `ssh`, and standard `ps`/`awk`. The helper
-uses **one fixed persistent profile**, `$HOME/.local/share/pi-browser/firefox-9222`.
-If port `127.0.0.1:9222` responds, it checks this user's Firefox process arguments
-for that exact profile and debugging port before reusing it. An ordinary browser,
-another profile, or an unverified listener is refused; an HTTP response alone is
-not enough. An already-running dedicated instance is left untouched. This is an
-incidental-mismatch check, not protection against malicious same-user processes.
+prompts on `/dev/tty` (so the piped command works) for:
 
-If no listener exists and that profile is not already running, the helper discovers
-and starts Firefox on Darwin/Linux as the desktop user, inheriting the
-display/Wayland environment. A busy profile without an available debugging port
-is an error; it never removes profile locks or restarts a browser. It never uses
-the default browser profile, sudo, headless mode, or disabled sandboxing. A failed
-startup reports the profile's `browser.log`. A Chromium published the same way
+1. **Default Firefox profile** — the publisher user's normal logins and history.
+2. **Dedicated profile** — separate persistent logins in
+   `$HOME/.local/share/pi-browser/firefox-9222`, not a temporary profile.
+3. Cancel (`q` or an empty choice).
+
+There is no unattended default. The ordinary profile is resolved from
+`~/.mozilla/firefox/profiles.ini` on Linux or
+`~/Library/Application Support/Firefox/profiles.ini` on macOS: the single Install
+default, otherwise the single profile marked `Default=1`. Missing or ambiguous
+configuration fails explicitly; no profile is guessed or copied.
+
+If port `127.0.0.1:9222` responds, the helper checks this user's Firefox process
+arguments for the **selected** profile and debugging port before reusing it.
+An ordinary browser, another profile (including the other menu choice), or an
+unverified listener is refused; an HTTP response alone is not enough. Quit that
+browser yourself before changing profiles. A verified instance is left untouched.
+This is an incidental-mismatch check, not protection against malicious same-user
+processes.
+
+Without a listener, the default-profile option asks you to **save your work and
+fully quit Firefox yourself**, then press Enter to reopen it with debugging (or
+cancel). It does not signal or kill Firefox. A still-running selected or
+unverifiable ordinary Firefox is refused. The dedicated option can start alongside
+ordinary Firefox, but refuses an explicitly busy dedicated profile. Firefox itself
+also enforces its profile lock; the helper never removes locks.
+
+Firefox starts as the desktop user on Darwin/Linux, inheriting the display/Wayland
+environment. No sudo, headless mode, disabled sandboxing, profile copying, or changes
+to an existing profile's permissions. Startup failures point to
+`~/.local/state/pi-browser/firefox-9222.log`. A Chromium published the same way
 (debugging on 127.0.0.1:9222, socket forwarded into the same directory) also
 works: the broker detects Chromium by its `/json/version` browser WebSocket URL and
 otherwise uses Firefox WebDriver BiDi. This helper launches only Firefox.
@@ -460,6 +480,7 @@ node --test --test-concurrency=1 test/capture.test.ts test/web-capture-expressio
 node --test test/web-extract-review.test.ts
 node --test --test-concurrency=1 test/browser-tool.test.ts test/extension.test.ts
 node --test test/browser-remote.test.ts
+node --test test/browser-publisher.test.ts
 node --test --test-concurrency=1 test/backend-command.test.ts test/web-backend.test.ts
 node --test --test-concurrency=1 test/browser-command.test.ts test/browser-selection.test.ts test/broker.test.ts
 

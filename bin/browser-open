@@ -20,7 +20,65 @@ case "$name" in
   ''|[!a-zA-Z0-9]*|*[!a-zA-Z0-9_.-]*) fail 'Hostname must start with a letter or digit and contain only letters, digits, dots, underscores or hyphens.' ;;
 esac
 [ "${#name}" -le 64 ] || fail 'Hostname must be at most 64 characters.'
-profile="$HOME/.local/share/pi-browser/firefox-9222"
+# stdin contains this script when invoked as ssh ... | sh, not terminal input.
+( : </dev/tty ) 2>/dev/null || fail 'Run this command in a real desktop terminal; a profile choice is required.'
+exec 3<>/dev/tty
+printf '%s\n' 'Publish Firefox:' '  1) Default profile (your normal logins; quit and reopen if needed)' '  2) Dedicated profile (separate, persistent logins)' '  q) Cancel' >&3
+printf 'Choose [1/2/q]: ' >&3
+IFS= read -r choice <&3 || fail 'Profile selection cancelled.'
+case "$choice" in
+  1) kind=default ;;
+  2) kind=dedicated ;;
+  q|Q|'') exit 0 ;;
+  *) fail 'Choose 1, 2, or q; no browser was touched.' ;;
+esac
+
+case "$(uname -s)" in
+  Darwin) root="$HOME/Library/Application Support/Firefox" ;;
+  Linux) root="$HOME/.mozilla/firefox" ;;
+  *) fail 'Firefox publishing supports Darwin and Linux.' ;;
+esac
+if [ "$kind" = default ]; then
+  [ -r "$root/profiles.ini" ] || fail "No Firefox profiles.ini in $root; start Firefox once to create its default profile, or choose the dedicated profile."
+  # Same selection rule as firefoxDefaultProfile: one Install default, else one
+  # Profile with Default=1. Never guess between installations or profile names.
+  profile=$(awk '
+    /^[[:space:]]*\[.+\][[:space:]]*$/ {
+      section++
+      name = $0
+      sub(/^[[:space:]]*\[/, "", name)
+      sub(/\][[:space:]]*$/, "", name)
+      names[section] = name
+      next
+    }
+    section && /^[[:space:]]*[^=;#]+=/ {
+      key = substr($0, 1, index($0, "=") - 1)
+      value = substr($0, index($0, "=") + 1)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+      values[section, key] = value
+    }
+    END {
+      for (i = 1; i <= section; i++) {
+        if (names[i] ~ /^Install/ && values[i, "Default"] != "") {
+          installs++
+          install = values[i, "Default"]
+        }
+        if (names[i] ~ /^Profile/ && values[i, "Default"] == "1" && values[i, "Path"] != "") {
+          defaults++
+          profile = values[i, "Path"]
+        }
+      }
+      if (installs == 1) print install
+      else if (installs == 0 && defaults == 1) print profile
+      else exit 1
+    }
+  ' "$root/profiles.ini") || fail "Firefox default profile is ambiguous in $root/profiles.ini; choose its default in Firefox or use the dedicated profile."
+  case "$profile" in /*) ;; *) profile="$root/$profile" ;; esac
+  [ -d "$profile" ] || fail "Firefox default profile does not exist: $profile. No profile was created."
+else
+  profile="$HOME/.local/share/pi-browser/firefox-9222"
+fi
 
 listening() {
   # Firefox returns HTTP 400 here; do not treat a response alone as ownership.
@@ -37,7 +95,14 @@ firefox_state() {
       if (executable != "firefox" && executable != "firefox-esr" && executable != "firefox-bin") next
       args = " " $0 " "
       profile = ENVIRON["PI_BROWSER_PROFILE"]
-      if (!index(args, " --profile " profile " ") && !index(args, " --profile=" profile " ")) next
+      if (index(args, " -contentproc ")) next
+      if (!index(args, " --profile " profile " ") && !index(args, " --profile=" profile " ") &&
+          !index(args, " -profile " profile " ") && !index(args, " -profile=" profile " ")) {
+        # Ordinary default-profile launches have no --profile argument. Their
+        # profile cannot be verified from ps, so require a human quit, not a PID kill.
+        if (!index(args, " --profile ") && !index(args, " --profile=") && !index(args, " -profile ") && !index(args, " -profile=") && state == "") state = "unverified"
+        next
+      }
       state = "busy"
       if (index(args, " --remote-debugging-port 9222 ") ||
           index(args, " --remote-debugging-port=9222 ")) {
@@ -51,10 +116,20 @@ firefox_state() {
 
 state=$(firefox_state)
 if listening; then
-  [ "$state" = debugging ] || fail "Port 9222 is occupied, but this user's dedicated Firefox profile could not be verified: $profile. No browser was touched."
-  printf 'Reusing the dedicated Firefox profile %s; no browser will be restarted.\n' "$profile"
+  [ "$state" = debugging ] || fail "Port 9222 is occupied, but this user's selected Firefox profile could not be verified: $profile. Quit the browser using that port yourself before retrying; no browser was touched."
+  printf 'Reusing Firefox profile %s; no browser will be restarted.\n' "$profile"
 else
-  [ -z "$state" ] || fail "Firefox already has $profile open, but its debugging port is unavailable. Check $profile/browser.log or wait for startup; no second browser was started."
+  if [ "$kind" = default ]; then
+    printf '\nDefault profile: %s\n' "$profile" >&3
+    printf '%s\n' 'This exposes all its logged-in pages to Pi. Save your work and fully quit Firefox yourself.' 'Press Enter to reopen this profile with debugging, or type q to cancel.' >&3
+    IFS= read -r answer <&3 || fail 'Firefox startup cancelled.'
+    [ -z "$answer" ] || exit 0
+    state=$(firefox_state)
+    [ -z "$state" ] || fail 'Firefox is still running with this profile or without a verifiable profile argument. Fully quit it and rerun; no browser was stopped.'
+    listening && fail 'Port 9222 became occupied; no browser was started.'
+  else
+    case "$state" in busy|debugging) fail "Firefox already has $profile open, but its debugging port is unavailable. Quit it yourself or wait for startup; no second browser was started." ;; esac
+  fi
   case "$(uname -s)" in
     Darwin) bin='/Applications/Firefox.app/Contents/MacOS/firefox' ;;
     Linux) bin=$(command -v firefox || command -v firefox-esr) || fail 'Install Firefox on this publisher.' ;;
@@ -62,11 +137,15 @@ else
   esac
   [ -x "$bin" ] || fail "Firefox executable not found: $bin"
   umask 077
-  mkdir -p "$profile"
-  chmod 700 "$profile"
-  log="$profile/browser.log"
+  if [ "$kind" = dedicated ]; then
+    mkdir -p "$profile"
+    chmod 700 "$profile"
+  fi
+  log_directory="$HOME/.local/state/pi-browser"
+  mkdir -p "$log_directory"
+  log="$log_directory/firefox-9222.log"
   printf 'Starting Firefox with profile %s\n' "$profile"
-  nohup "$bin" --new-instance --profile "$profile" --remote-debugging-port 9222 </dev/null >>"$log" 2>&1 &
+  nohup "$bin" --new-instance --profile "$profile" --remote-debugging-port 9222 --remote-allow-hosts localhost,127.0.0.1 3>&- </dev/null >>"$log" 2>&1 &
   pid=$!
   attempts=0
   until listening; do
@@ -75,9 +154,10 @@ else
     [ "$attempts" -lt 15 ] || fail "Firefox did not open port 9222. Check $log; no browser was stopped."
     sleep 1
   done
-  [ "$(firefox_state)" = debugging ] || fail "Cannot verify the dedicated Firefox profile on port 9222. Check $log; no tunnel was opened."
+  [ "$(firefox_state)" = debugging ] || fail "Cannot verify the selected Firefox profile on port 9222. Check $log; no tunnel was opened."
 fi
 
+exec 3>&-
 printf 'Publishing remote %s to %s. Ctrl+C closes the tunnel, not the browser.\n' "$name" "$target"
 printf '%s\n' 'If forwarding fails on an old socket, confirm its previous tunnel stopped before removing only that socket on the Pi host.'
 exec ssh -NT -o ExitOnForwardFailure=yes -R "$socket_directory/$name.sock:127.0.0.1:9222" "$target"
