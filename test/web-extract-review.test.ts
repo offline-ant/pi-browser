@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { launchBrowser } from "../src/core/index.ts";
-import { inspectionExpression, type PageInspection } from "../src/web/extract.ts";
+import { captureExpression, inspectionExpression, type PageInspection } from "../src/web/extract.ts";
 
 const pages: Record<string, string> = {
   "/roots": '<main hidden>Hidden wrong article</main><main></main><article><h1>Actual article</h1><p>A short but complete article.</p></article>',
@@ -22,6 +22,13 @@ const pages: Record<string, string> = {
   "/hidden-challenge": '<div hidden><form id="challenge-form">Please verify you are human</form></div><main><p>Unblocked article.</p></main>',
   "/challenge-documentation": '<article><h1>CAPTCHA implementation guide</h1><p>Show the message "Please verify you are human" when a challenge is required.</p></article>',
   "/empty-search": '<main>No results found.</main>',
+  // DuckDuckGo's live React empty state: no semantic empty-result marker.
+  "/ddg-empty": `<div id="react-layout"><div>
+    <p><span>No results found for <b>"1005012986342860"</b></span></p>
+    <div><p>Suggestions:</p><ul><li>Check spelling</li><li>Try related keywords</li>
+      <li>Retry search without quotes: <a href="/?q=1005012986342860">1005012986342860</a></li>
+    </ul></div><form><textarea>"1005012986342860"</textarea><button>Submit to Duck.ai</button></form>
+  </div></div>`,
   "/query-search": '<main><h1>Search query: no results found</h1><p>Loading the search results.</p></main>',
   "/article-search": '<main><article><h1>No results found</h1><a href="/help">Troubleshooting search issues</a></article></main>',
   "/huge-pre": `<main><pre>${"x".repeat(800_000)}</pre><p>Never traverse unlimited text.</p></main>`,
@@ -35,7 +42,7 @@ test("bounded nonmutating extraction handles composed DOM, root selection and se
   const root = await mkdtemp(path.join(tmpdir(), "pi-extract-review-"));
   const server = http.createServer((request, response) => {
     response.setHeader("Content-Type", "text/html; charset=utf-8");
-    response.end(`<!doctype html><title>Local extraction fixture</title>${pages[request.url ?? ""] ?? "<main>Missing fixture</main>"}`);
+    response.end(`<!doctype html><title>Local extraction fixture</title>${pages[new URL(request.url ?? "/", "http://fixture.test").pathname] ?? "<main>Missing fixture</main>"}`);
   });
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
@@ -82,6 +89,55 @@ test("bounded nonmutating extraction handles composed DOM, root selection and se
         assert.equal((await inspect("/empty-search", "search")).noResults, true);
         assert.equal((await inspect("/query-search", "search")).noResults, false);
         assert.equal((await inspect("/article-search", "search")).noResults, false);
+      });
+      await t.test("recognizes DuckDuckGo's React empty message with suggestions and punctuation", async () => {
+        for (const query of ['"1005012986342860"', '"why?! a.b [c]+ (d) <e> & f"', "no results found"]) {
+          await tab.navigate(base + "/ddg-empty?q=" + encodeURIComponent(query));
+          await tab.evaluate(`document.querySelector('#react-layout b').textContent = ${JSON.stringify(query)}`);
+          const result = await tab.evaluate(inspectionExpression("search", "duckduckgo")) as PageInspection;
+          assert.equal(result.noResults, true, query);
+          assert.deepEqual(result.results, []);
+          assert.equal(result.attention, undefined);
+          const captured = await tab.evaluate(captureExpression("search", "duckduckgo")) as { json: PageInspection };
+          assert.equal(captured.json.noResults, true);
+          assert.deepEqual(captured.json.results, []);
+          for (const engine of ["bing", "brave"] as const) {
+            assert.equal((await tab.evaluate(inspectionExpression("search", engine)) as PageInspection).noResults, false);
+          }
+        }
+      });
+      await t.test("rejects hidden, stale, loading and result-card DuckDuckGo empty messages", async () => {
+        const mutations = [
+          "document.querySelector('#react-layout').hidden = true",
+          "document.querySelector('#react-layout').style.display = 'none'",
+          "document.querySelector('#react-layout p').style.visibility = 'hidden'",
+          "document.querySelector('#react-layout').setAttribute('aria-busy', 'true')",
+          "document.querySelector('#react-layout b').textContent = 'different query'",
+          "document.querySelector('#react-layout p').textContent = 'Loading results…'",
+          "document.querySelector('#react-layout p').remove()",
+          "document.querySelector('#react-layout').removeAttribute('id')",
+          "history.replaceState(null, '', '/ddg-empty')",
+          "document.querySelector('#react-layout p').outerHTML = '<p>Search query: no results found</p>'",
+          "document.querySelector('#react-layout p').insertAdjacentHTML('beforeend', '<a href=\"/help\">Help</a>')",
+          ...['article', 'div data-testid="result"', 'div class="result"'].map(tag =>
+            `document.querySelector('#react-layout').innerHTML = '<${tag}>' + document.querySelector('#react-layout').innerHTML + '</${tag.split(' ')[0]}>'`),
+          "document.querySelector('#react-layout').insertAdjacentHTML('beforeend', '<div class=\"result\"><a class=\"result__a\" href=\"https://example.test/\">Actual result</a></div>')",
+        ];
+        for (const mutation of mutations) {
+          await tab.navigate(base + '/ddg-empty?q=%221005012986342860%22');
+          await tab.evaluate(mutation);
+          const result = await tab.evaluate(inspectionExpression("search", "duckduckgo")) as PageInspection;
+          assert.equal(result.noResults, false, mutation);
+        }
+      });
+      await t.test("verification and consent take precedence over DuckDuckGo's empty message", async () => {
+        for (const markup of ['<form id="challenge-form">Verify you are human</form>', '<div role="dialog">Review cookies and privacy choices</div>']) {
+          await tab.navigate(base + '/ddg-empty?q=%221005012986342860%22');
+          await tab.evaluate(`document.body.insertAdjacentHTML('beforeend', ${JSON.stringify(markup)})`);
+          const result = await tab.evaluate(inspectionExpression("search", "duckduckgo")) as PageInspection;
+          assert.ok(result.attention);
+          assert.equal(result.noResults, false);
+        }
       });
       await t.test("huge code, ragged tables, and deep DOM stay bounded and report omissions", async () => {
         for (const route of ["/huge-pre", "/ragged-table", "/depth"]) {

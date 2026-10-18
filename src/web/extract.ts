@@ -276,7 +276,15 @@ function observePage(kind: "search" | "fetch", engine: "duckduckgo" | "bing" | "
     }
     // A phrase in a query, help link or article is not an empty-result signal.
     // Require a short standalone message in a result/message container.
+    const query = new URL(sourceUrl).searchParams.get("q")?.replace(/\s+/g, " ").trim();
     result.noResults = !result.results.length && elements.some(node => {
+      // DuckDuckGo's React layout uses an unlabelled paragraph, followed by
+      // suggestions and retry links. Match only its message and current query.
+      if (engine === "duckduckgo" && query && matches(node, "#react-layout p") && present(node)
+        && !node.element?.closest('article, [data-testid="result"], .result, [aria-busy="true"]')) {
+        const text = plain(node, 501).replace(/\s+/g, " ").trim();
+        if (text.length <= 500 && !descendant(node, "a") && text === `No results found for ${query}`) return true;
+      }
       if (!matches(node, 'main, [role="main"], .b_no, .no-results, .no-results__message, [data-testid="no-results"]')) return false;
       const text = plain(node, 501).replace(/\s+/g, " ").trim();
       return text.length <= 500 && !descendant(node, "a") && /^(?:no (?:web |search )?results(?: found)?(?: for\b[^.!?]*)?|(?:your search\b.{0,250})?did not match any (?:documents|results)|we couldn't find any results)[.!]?$/i.test(text);

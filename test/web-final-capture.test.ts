@@ -129,6 +129,37 @@ test("search evidence and preview use captured results, with all sources saved a
   assert.match((await snapshots.read(result.snapshot!.id, "md")).text!, /Final source 34/);
 });
 
+test("confirmed empty search succeeds without attention and saves zero source counts", async t => {
+  const { state, research, json, snapshots } = await fixture(t, "search");
+  state.poll.noResults = state.final.noResults = true;
+  const result = await research.run("search", '"1005012986342860"', 10, undefined, async () => {
+    assert.fail("A confirmed empty search must not request intervention");
+  });
+  assert.deepEqual(result.results, []);
+  assert.equal(result.sourceCount, 0);
+  assert.equal(result.output, "The search engine reported no results.");
+  assert.equal(state.captures, 1);
+  const saved = await json(result.snapshot!);
+  assert.equal(saved.metadata.status, "complete");
+  assert.equal(saved.metadata.sourceCount, 0);
+  assert.equal(saved.metadata.returnedCount, 0);
+  assert.equal(saved.data.noResults, true);
+  assert.deepEqual(saved.data.results, []);
+  assert.match((await snapshots.read(result.snapshot!.id, "md")).text!, /The search engine reported no results\./);
+});
+
+test("empty search poll cannot substitute for an unconfirmed final capture", async t => {
+  const { state, research } = await fixture(t, "search");
+  state.poll.noResults = state.final.noResults = true;
+  state.onCapture = async () => capture(state.captures === 1
+    ? inspect({ noResults: false, markdown: "Loading results" })
+    : state.final);
+  const result = await research.run("search", "query", 10);
+  assert.equal(state.captures, 2);
+  assert.equal(result.sourceCount, 0);
+  assert.equal(result.output, "The search engine reported no results.");
+});
+
 test("cancelling final capture preserves previous completed evidence and never recaptures", async t => {
   const { state, research, json } = await fixture(t);
   const controller = new AbortController();
