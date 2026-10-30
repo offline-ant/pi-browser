@@ -171,7 +171,13 @@ Chromium starts with `--disable-blink-features=AutomationControlled`, because
 Cloudflare managed challenges never clear while `navigator.webdriver` is true.
 Firefox has no equivalent switch, so its BiDi session adds a preload script that
 makes `navigator.webdriver` report false in every new page and frame. It applies
-to launched and remote Firefox and ends with the session. Workers still see true.
+to launched and remote Firefox and ends with the session. Workers have no
+`navigator.webdriver`.
+
+Firefox 159 also has an experimental "Remote control for AI assistants" mode
+(`remote.experimental.dynamicstart.enabled`) that keeps the value natively false.
+It is not used here: `--remote-debugging-port` always counts as automation, and
+the mode has no command-line start.
 
 ## Tool behavior
 
