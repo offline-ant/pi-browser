@@ -167,6 +167,12 @@ Headed Chromium
 starts with a 1280×900 window so fresh profiles cannot default to an empty content
 viewport and hang screenshot capture; headless geometry is unchanged.
 
+Chromium starts with `--disable-blink-features=AutomationControlled`, because
+Cloudflare managed challenges never clear while `navigator.webdriver` is true.
+Firefox has no equivalent switch, so its BiDi session adds a preload script that
+makes `navigator.webdriver` report false in every new page and frame. It applies
+to launched and remote Firefox and ends with the session. Workers still see true.
+
 ## Tool behavior
 
 - `web_search({query, max_results?})`: compact numbered titles, links, and excerpts,

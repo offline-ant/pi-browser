@@ -7,7 +7,20 @@ import { tabName } from "../src/broker/broker.ts";
 import { BrowserClient, BrowserUnavailable } from "../src/broker/client.ts";
 import { processAlive } from "../src/broker/protocol.ts";
 import { Cdp } from "../src/core/cdp.ts";
+import { launchBrowser } from "../src/core/index.ts";
 import { brokerPids, fixtureServer, htmlPage, isolateBrokers, waitFor } from "./helpers.ts";
+
+for (const browser of ["chromium", "firefox"] as const) {
+  test(`${browser} pages do not report automation through navigator.webdriver`, async t => {
+    const root = await isolateBrokers(t);
+    const origin = await fixtureServer(t, htmlPage);
+    const session = await launchBrowser({ browser, profileDir: path.join(root, "profile"), headless: true });
+    try {
+      const tab = await session.openTab(`${origin}/page`);
+      assert.equal(await tab.evaluate("navigator.webdriver"), false);
+    } finally { await session.close(); }
+  });
+}
 
 test("tab names: host without www plus the length of everything after it", () => {
   assert.equal(tabName("https://www.google.com/search"), "google.com+6");

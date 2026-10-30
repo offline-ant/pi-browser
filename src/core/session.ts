@@ -9,6 +9,9 @@ import type { BrowserKind, BrowserConnectOptions, BrowserOptions, BrowserSession
 
 interface OwnedProcess { launcher: BrowserProcessLauncher; runtime: NativeBrowserProcess; }
 
+/** Firefox has no switch for this: its remote agent forces navigator.webdriver true, which Cloudflare managed challenges never clear. */
+const HIDE_FIREFOX_AUTOMATION = `() => { Object.defineProperty(Navigator.prototype, "webdriver", { get: () => false, configurable: true, enumerable: true }); }`;
+
 /** Protocol connection ownership is independent from browser-process ownership. */
 export class BrowserConnection implements BrowserSession {
   private kind: BrowserKind;
@@ -80,6 +83,8 @@ export class BrowserConnection implements BrowserSession {
         if (error instanceof BidiCommandError) this.bidiSession = false;
         throw error;
       }
+      signal?.throwIfAborted();
+      await bidi.request("script.addPreloadScript", { functionDeclaration: HIDE_FIREFOX_AUTOMATION }, 5_000);
       signal?.throwIfAborted();
       bidi.onEvent((method, params) => {
         if (method === "browsingContext.contextDestroyed" && typeof params.context === "string") this.destroyed(params.context);

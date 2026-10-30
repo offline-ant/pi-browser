@@ -159,6 +159,8 @@ export class BrowserProcessLauncher {
       "--remote-debugging-port=0", "--remote-debugging-address=127.0.0.1",
       `--user-data-dir=${options.profileDir}`, "--no-first-run", "--no-default-browser-check",
       "--disable-background-networking", "--disable-gpu",
+      // Cloudflare managed challenges never clear while navigator.webdriver is true.
+      "--disable-blink-features=AutomationControlled",
       // A fresh headed profile can otherwise get a zero-sized content viewport
       // from X11's default geometry, leaving screenshot requests hung indefinitely.
       ...(!options.headless ? ["--window-size=1280,900"] : []), ...(options.chromiumArgs ?? []),
