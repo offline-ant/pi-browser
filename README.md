@@ -1,3 +1,5 @@
+> **Archived.** This project now lives in [Phimacs](https://github.com/offline-ant/phimacs) as `packages/browser`.
+
 # pi-browser
 
 Shared Chromium/CDP and Firefox/WebDriver BiDi infrastructure, plus `browser`,
